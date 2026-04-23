@@ -305,6 +305,16 @@ mkdir -p "$TMPDIR"
 python pipeline_watchdog.py --config config/trellis_github_archives_6_first100.yaml
 ```
 
+**Two-phase control (render first, encode later):** use the same `pipeline_state.json`. After all shards have `mesh.ply`, run encode.
+
+```bash
+# Phase 1 — download + Blender only; set pipeline.watchdog.delete_source_shard_tar_after_render: true to drop .tar.zst when done
+python pipeline_watchdog.py --config config/trellis_github_archives_6_first100.yaml --render-only
+
+# Phase 2 — no download/render; only encode + optional hf.upload
+python pipeline_watchdog.py --config config/trellis_github_archives_6_first100.yaml --encode-only
+```
+
 **Single cycle then exit (smoke test or cron):**
 
 ```bash

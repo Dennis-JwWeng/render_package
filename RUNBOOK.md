@@ -4,8 +4,10 @@
 
 | 场景 | 命令 | 说明 |
 |------|------|------|
-| **推荐：看门狗闭环** | `python pipeline_watchdog.py --config <yaml>` | 校验配置 → 按区间下载 → 解压/渲染 → 编码 →（可选）打包上传；循环；状态写入 `data_root/github/pipeline_state.json` |
-| 单轮测试 | `python pipeline_watchdog.py --config <yaml> --once` | 只跑一轮后退出，适合 cron / 手工试跑 |
+| **推荐：看门狗闭环（全流程）** | `python pipeline_watchdog.py --config <yaml>` | 下载 → 渲染 → 编码 →（可选）上传；状态 `pipeline_state.json` |
+| **只看门狗：只渲染** | `python pipeline_watchdog.py --config <yaml> --render-only` | 下载 → 仅 Blender；shard 全员 `mesh.ply` 后记 `render_only_done`，可按 `delete_source_shard_tar_after_render` 删 tar；**不编码、不上传** |
+| **只看门狗：只编码** | `python pipeline_watchdog.py --config <yaml> --encode-only` | 不下载、不渲染；只对磁盘上已是 `render_done` 的 shard 跑 encode +（可选）上传；适合渲染跑完后第二阶段 |
+| 单轮测试 | `python pipeline_watchdog.py --config <yaml> --once` | 只跑一轮后退出；可与 `--render-only` / `--encode-only` 组合 |
 | 仅渲染+编码（本机已有 tar） | `SPCONV_ALGO=native python run_pipeline.py --config <yaml> --render_gpus 0,1 --encode_gpus 2,3` | 不下载、不看门狗；从 `paths.shard_dir` 取 `.tar.zst` |
 | 仅补编码 | `SPCONV_ALGO=native python run_pipeline.py --config <yaml> --encode_only` | 扫 `render_dir` 未 encode 完成的 object |
 | 仅下载 | `python download_trellis.py …` | 与 `hf.download` 参数对齐；见脚本 `--help` |

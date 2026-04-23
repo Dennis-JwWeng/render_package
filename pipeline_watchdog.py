@@ -2,18 +2,24 @@
 """
 Watchdog entrypoint: validate config → download (range) → render → encode → upload, in a loop, with JSON state.
 
+**Modes** (pick one; split work across two processes if you want render-first, encode-later):
+
+- **Default (full):** download → render → encode → (optional) upload — same state file.
+- **`--render-only`:** download → render only. When a shard is fully rendered (all `mesh.ply`),
+  mark `render_encode` = `render_only_done`, optionally delete `shards/github/<stem>.tar.zst`
+  (`pipeline.watchdog.delete_source_shard_tar_after_render: true`). No encode / no HF upload.
+- **`--encode-only`:** no download, no Blender; only encode shards that are `render_done` on disk
+  (e.g. after a render-only pass). Then same upload rules as full mode if `hf.upload.enabled`.
+
 Uses the same YAML as run_pipeline / upload_hf_encoded_shards (paths, hf.download, hf.upload, gpus, stages).
 
 State file (default: <data_root>/github/pipeline_state.json):
   - Tracks per-shard download / render_encode / upload and last_error
-  - Reconciles with disk + Hub when possible
+  - `render_only_done` = render phase finished under `--render-only`, waiting for encode watchdog
 
 Download: only when disk says the shard still needs a local .tar.zst for decompress/render
   (partial / not started). encode_done and render_done skip download; render_done runs encode only.
   Set pipeline.watchdog.prefetch_downloads: true for bulk parallel prefetch at cycle start.
-
-Soft failures: pipeline.watchdog.incomplete_encode_as (error|partial) and max_encode_passes (-1=unlimited)
-  control whether incomplete encode is a hard error and how many encode runs to attempt per shard.
 
 Encode: uses all IDs in gpus.encode (same worker pool as run_pipeline.py). Prefer gpus.pool in YAML so
   render and encode share one list (full GPUs for Blender, then the same GPUs for encode).
@@ -22,6 +28,8 @@ Usage:
   export HUGGINGFACE_HUB_TOKEN=...   # if upload enabled (or hf.upload.token in <config>.local.yaml)
   export SPCONV_ALGO=native
   python pipeline_watchdog.py --config config/default.yaml
+  python pipeline_watchdog.py --config config/default.yaml --render-only
+  python pipeline_watchdog.py --config config/default.yaml --encode-only
 
   python pipeline_watchdog.py --config config/default.yaml --once   # single cycle then exit
 """
@@ -90,7 +98,7 @@ def _shard_entry() -> dict[str, Any]:
     }
 
 
-def validate_config(cfg: dict, config_path: str) -> None:
+def validate_config(cfg: dict, config_path: str, *, watchdog_mode: str = "full") -> None:
     paths = cfg["paths"]
     hf_dl = (cfg.get("hf") or {}).get("download") or {}
     if not hf_dl.get("repo_pattern") or hf_dl.get("suffix") is None:
@@ -107,12 +115,12 @@ def validate_config(cfg: dict, config_path: str) -> None:
             raise SystemExit(f"Cannot create data_root/dest {dest}: {e}") from e
     for key in ("shard_dir", "render_dir", "raw_dir"):
         os.makedirs(paths[key], exist_ok=True)
-    if cfg.get("stages", {}).get("render", True):
+    if watchdog_mode != "encode_only" and cfg.get("stages", {}).get("render", True):
         b = paths.get("blender_bin")
         if not b or not os.path.isfile(b):
             raise SystemExit(f"Blender not found at paths.blender_bin: {b}")
     up = (cfg.get("hf") or {}).get("upload") or {}
-    if up.get("enabled", False):
+    if up.get("enabled", False) and watchdog_mode != "render_only":
         if not hf_hub_token(cfg):
             raise SystemExit(
                 "hf.upload.enabled but no token: set HUGGINGFACE_HUB_TOKEN / HF_TOKEN or hf.upload.token in .local.yaml"
@@ -337,21 +345,83 @@ def _remote_tar_set(
     return names
 
 
+def _delete_source_shard_tar_after_render_if_enabled(cfg: dict, shard_stem: str) -> None:
+    """Remove shards/github/<stem>.tar.zst when pipeline.watchdog.delete_source_shard_tar_after_render is true."""
+    wd = (cfg.get("pipeline", {}).get("watchdog", {}) or {})
+    if not wd.get("delete_source_shard_tar_after_render", False):
+        return
+    shard_dir = cfg["paths"]["shard_dir"]
+    zst = os.path.join(shard_dir, f"{shard_stem}.tar.zst")
+    if os.path.isfile(zst):
+        os.remove(zst)
+        print(f"[CLEANUP] removed source shard tar after render {zst}", flush=True)
+
+
+def _try_upload_shard_after_encode_done(
+    config_path: str,
+    cfg: dict,
+    stem: str,
+    ent: dict[str, Any],
+    remote_shards: set[str] | None,
+    hf_token: str | None,
+) -> None:
+    """Run HF upload + tar cleanup when hf.upload.enabled and shard is encode_done on disk."""
+    hf_up = (cfg.get("hf") or {}).get("upload") or {}
+    upload_enabled = bool(hf_up.get("enabled", False))
+    path_in_repo = (hf_up.get("path_in_repo") or "github/render").strip("/")
+
+    from huggingface_hub import HfApi
+    from upload_hf_encoded_shards import _remote_size, delete_source_shard_tar_if_enabled
+
+    hf_api = HfApi(token=hf_token)
+
+    if not upload_enabled:
+        ent["upload"] = "skipped"
+        delete_source_shard_tar_if_enabled(cfg, stem)
+        return
+
+    if remote_shards is not None and stem in remote_shards:
+        ent["upload"] = "done"
+        ent["last_error"] = None
+        if cfg.get("pipeline", {}).get("delete_source_shard_tar"):
+            rel = f"{path_in_repo}/{stem}.tar.zst"
+            rsz = _remote_size(
+                hf_api,
+                hf_up["repo_id"],
+                hf_up.get("repo_type", "dataset"),
+                rel,
+            )
+            if rsz and rsz > 0:
+                delete_source_shard_tar_if_enabled(cfg, stem)
+        return
+
+    print(f"[WATCHDOG] {stem}: upload", flush=True)
+    try:
+        run_upload_subprocess(os.path.abspath(config_path), stem)
+        if remote_shards is not None:
+            remote_shards.add(stem)
+        ent["upload"] = "done"
+        ent["last_error"] = None
+    except Exception as e:
+        ent["upload"] = "error"
+        ent["last_error"] = str(e)
+        print(f"[WATCHDOG] upload ERROR {stem}: {e}", flush=True)
+
+
 def one_cycle(
     config_path: str,
     cfg: dict,
     state: dict[str, Any],
     remote_shards: set[str] | None,
     hf_token: str | None = None,
+    *,
+    mode: str = "full",
 ) -> None:
     paths = cfg["paths"]
     shard_dir = paths["shard_dir"]
     render_dir = paths["render_dir"]
     raw_dir = paths["raw_dir"]
     render_tmp = paths.get("render_tmp")
-    hf_up = (cfg.get("hf") or {}).get("upload") or {}
-    upload_enabled = bool(hf_up.get("enabled", False))
-    path_in_repo = (hf_up.get("path_in_repo") or "github/render").strip("/")
 
     from encoders import ALL_STAGES
 
@@ -375,10 +445,6 @@ def one_cycle(
         encode_retry_policy = "any_incomplete"
 
     import render_github as rg
-    from huggingface_hub import HfApi
-    from upload_hf_encoded_shards import _remote_size, delete_source_shard_tar_if_enabled
-
-    hf_api = HfApi(token=hf_token)
 
     for stem in stems:
         if STOP:
@@ -394,6 +460,163 @@ def one_cycle(
             continue
 
         st = classify.get(stem)
+
+        # ── Render-only watchdog: download + Blender only; optional delete .tar.zst after full render ──
+        if mode == "render_only":
+            if st == "encode_done":
+                ent["encode_passes"] = 0
+                ent["last_error"] = None
+                ent.pop("skip_reason", None)
+                ent["render_encode"] = "done"
+                print(f"[WATCHDOG] {stem}: encode_done — skip (render-only mode)", flush=True)
+                ent["upload"] = "skipped"
+                continue
+            if ent.get("render_encode") == "render_only_done":
+                print(f"[WATCHDOG] {stem}: render_only_done — skip", flush=True)
+                continue
+
+            needs_tar = st not in ("encode_done", "render_done")
+            if needs_tar:
+                if not (os.path.isfile(zst) and os.path.getsize(zst) > 0):
+                    print(f"[WATCHDOG] {stem}: download .tar.zst (render-only)", flush=True)
+                    if not download_one_shard_tar(cfg, stem):
+                        ent["download"] = "pending"
+                        ent["last_error"] = "download_failed"
+                        continue
+                    if not (os.path.isfile(zst) and os.path.getsize(zst) > 0):
+                        ent["download"] = "pending"
+                        ent["last_error"] = "missing_local_tar_after_download"
+                        continue
+                ent["download"] = "done"
+            else:
+                if os.path.isfile(zst) and os.path.getsize(zst) > 0:
+                    ent["download"] = "done"
+                else:
+                    ent["download"] = "not_required"
+                print(f"[WATCHDOG] {stem}: skip tar download (render-only; status={st})", flush=True)
+
+            if st == "render_done":
+                ent["render_encode"] = "render_only_done"
+                ent["last_error"] = None
+                _delete_source_shard_tar_after_render_if_enabled(cfg, stem)
+                ent["upload"] = "skipped"
+                print(f"[WATCHDOG] {stem}: render-only checkpoint (all mesh on disk)", flush=True)
+                continue
+
+            print(f"[WATCHDOG] {stem}: render-only render (status was {st})", flush=True)
+            try:
+                shard_render = os.path.join(render_dir, stem)
+                rg.render_shard_from_zst(
+                    zst_path=zst,
+                    render_dir=render_dir,
+                    raw_dir=raw_dir,
+                    gpu_ids=render_gpus,
+                    num_workers=num_workers,
+                    num_views=num_views,
+                    render_tmp=render_tmp,
+                    no_delete_shard=no_delete_shard,
+                )
+                classify = _classify_all(render_dir, stages, cfg, state)
+                st2 = classify.get(stem)
+                if st2 not in ("render_done", "encode_done"):
+                    if not os.path.isdir(shard_render):
+                        ent["skip_reason"] = "empty_tar_no_models"
+                    ent["render_encode"] = "partial"
+                    ent["last_error"] = (
+                        None if incomplete_as == "partial" else "render_incomplete_render_only"
+                    )
+                    print(
+                        f"[WATCHDOG] {stem}: render-only incomplete after render (status={st2!r})",
+                        flush=True,
+                    )
+                    continue
+                if st2 == "encode_done":
+                    ent["render_encode"] = "done"
+                else:
+                    ent["render_encode"] = "render_only_done"
+                ent["last_error"] = None
+                ent["encode_passes"] = 0
+                _delete_source_shard_tar_after_render_if_enabled(cfg, stem)
+                ent["upload"] = "skipped"
+            except Exception as e:
+                ent["render_encode"] = "error"
+                ent["last_error"] = str(e)
+                print(f"[WATCHDOG] ERROR {stem}: {e}", flush=True)
+            continue
+
+        # ── Encode-only watchdog: no download / no Blender; encode + optional upload ──
+        if mode == "encode_only":
+            if st == "encode_done":
+                ent["encode_passes"] = 0
+                ent["last_error"] = None
+                ent.pop("skip_reason", None)
+                ent["render_encode"] = "done"
+                print(f"[WATCHDOG] {stem}: encode_done — skip tar/render", flush=True)
+                _try_upload_shard_after_encode_done(
+                    config_path, cfg, stem, ent, remote_shards, hf_token
+                )
+                continue
+            if st != "render_done":
+                print(
+                    f"[WATCHDOG] {stem}: encode-only skip (need render_done on disk; status={st!r})",
+                    flush=True,
+                )
+                continue
+
+            if os.path.isfile(zst) and os.path.getsize(zst) > 0:
+                ent["download"] = "done"
+            else:
+                ent["download"] = "not_required"
+            print(f"[WATCHDOG] {stem}: encode-only", flush=True)
+            shard_render = os.path.join(render_dir, stem)
+            passes = int(ent.get("encode_passes", 0))
+            if max_encode_passes >= 0 and passes >= max_encode_passes:
+                print(
+                    f"[WATCHDOG] {stem}: skip encode (encode_passes={passes} >= max_encode_passes={max_encode_passes})",
+                    flush=True,
+                )
+                ent["render_encode"] = "partial"
+                ent["last_error"] = (
+                    None if incomplete_as == "partial" else "max_encode_passes_reached"
+                )
+                continue
+            try:
+                if not os.path.isdir(shard_render):
+                    raise FileNotFoundError(f"render_done but render dir missing: {shard_render}")
+                run_encode_shard_multigpu(
+                    os.path.abspath(config_path),
+                    shard_render,
+                    encode_gpus,
+                    prior_encode_passes=int(ent.get("encode_passes", 0)),
+                    encode_retry_policy=encode_retry_policy,
+                )
+                ent["encode_passes"] = int(ent.get("encode_passes", 0)) + 1
+                classify = _classify_all(render_dir, stages, cfg, state)
+                st = classify.get(stem)
+                if st == "encode_done":
+                    ent["render_encode"] = "done"
+                    ent["last_error"] = None
+                    ent["encode_passes"] = 0
+                    _try_upload_shard_after_encode_done(
+                        config_path, cfg, stem, ent, remote_shards, hf_token
+                    )
+                elif incomplete_as == "partial":
+                    ent["render_encode"] = "partial"
+                    ent["last_error"] = None
+                    print(
+                        f"[WATCHDOG] {stem}: encode still incomplete after pass — status={st!r}",
+                        flush=True,
+                    )
+                else:
+                    ent["render_encode"] = "error"
+                    ent["last_error"] = "encode_incomplete_after_pass"
+            except Exception as e:
+                ent["render_encode"] = "error"
+                ent["last_error"] = str(e)
+                print(f"[WATCHDOG] ERROR {stem}: {e}", flush=True)
+            continue
+
+        # ── Full pipeline (render + encode + upload) ──
         if st == "encode_done":
             ent["encode_passes"] = 0
             ent["last_error"] = None
@@ -532,38 +755,9 @@ def one_cycle(
             continue
 
         ent["render_encode"] = "done"
-
-        if not upload_enabled:
-            ent["upload"] = "skipped"
-            delete_source_shard_tar_if_enabled(cfg, stem)
-            continue
-
-        if remote_shards is not None and stem in remote_shards:
-            ent["upload"] = "done"
-            ent["last_error"] = None
-            if cfg.get("pipeline", {}).get("delete_source_shard_tar"):
-                rel = f"{path_in_repo}/{stem}.tar.zst"
-                rsz = _remote_size(
-                    hf_api,
-                    hf_up["repo_id"],
-                    hf_up.get("repo_type", "dataset"),
-                    rel,
-                )
-                if rsz and rsz > 0:
-                    delete_source_shard_tar_if_enabled(cfg, stem)
-            continue
-
-        print(f"[WATCHDOG] {stem}: upload", flush=True)
-        try:
-            run_upload_subprocess(os.path.abspath(config_path), stem)
-            if remote_shards is not None:
-                remote_shards.add(stem)
-            ent["upload"] = "done"
-            ent["last_error"] = None
-        except Exception as e:
-            ent["upload"] = "error"
-            ent["last_error"] = str(e)
-            print(f"[WATCHDOG] upload ERROR {stem}: {e}", flush=True)
+        _try_upload_shard_after_encode_done(
+            config_path, cfg, stem, ent, remote_shards, hf_token
+        )
 
 
 def main() -> None:
@@ -571,7 +765,25 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Pipeline watchdog (download → render → encode → upload loop)")
     parser.add_argument("--config", type=str, default="config/default.yaml")
     parser.add_argument("--once", action="store_true", help="Run a single cycle and exit")
+    wg = parser.add_mutually_exclusive_group()
+    wg.add_argument(
+        "--render-only",
+        action="store_true",
+        help="Only download + Blender render; mark render_only_done; optional delete .tar.zst (watchdog YAML)",
+    )
+    wg.add_argument(
+        "--encode-only",
+        action="store_true",
+        help="Only encode (and optional upload); requires render_done on disk (e.g. after --render-only)",
+    )
     args = parser.parse_args()
+
+    if args.render_only:
+        watchdog_mode = "render_only"
+    elif args.encode_only:
+        watchdog_mode = "encode_only"
+    else:
+        watchdog_mode = "full"
 
     os.environ.setdefault("SPCONV_ALGO", "native")
 
@@ -587,7 +799,7 @@ def main() -> None:
 
     config_path = os.path.abspath(os.path.expanduser(args.config))
     cfg = load_config(config_path)
-    validate_config(cfg, config_path)
+    validate_config(cfg, config_path, watchdog_mode=watchdog_mode)
 
     state_path = _state_path(cfg)
     wd = cfg.get("pipeline", {}).get("watchdog", {}) or {}
@@ -595,7 +807,7 @@ def main() -> None:
 
     print(f"[WATCHDOG] config={config_path}", flush=True)
     print(f"[WATCHDOG] state={state_path}", flush=True)
-    print(f"[WATCHDOG] interval={interval}s once={args.once}", flush=True)
+    print(f"[WATCHDOG] mode={watchdog_mode} interval={interval}s once={args.once}", flush=True)
 
     while not STOP:
         state = load_state(state_path)
@@ -603,7 +815,7 @@ def main() -> None:
         print(f"\n{'='*60}\n[WATCHDOG] cycle {state['cycle']} {_utc_now()}\n{'='*60}", flush=True)
 
         try:
-            validate_config(cfg, config_path)
+            validate_config(cfg, config_path, watchdog_mode=watchdog_mode)
         except SystemExit as e:
             print(f"[WATCHDOG] config validation failed: {e}", flush=True)
             if args.once:
@@ -612,13 +824,13 @@ def main() -> None:
             continue
 
         wd_opts = cfg.get("pipeline", {}).get("watchdog", {}) or {}
-        if wd_opts.get("prefetch_downloads", False):
+        if watchdog_mode != "encode_only" and wd_opts.get("prefetch_downloads", False):
             run_download_phase(cfg)
 
         hf_up = (cfg.get("hf") or {}).get("upload") or {}
         remote: set[str] | None = None
         hf_tok = hf_hub_token(cfg)
-        if hf_up.get("enabled", False):
+        if watchdog_mode != "render_only" and hf_up.get("enabled", False):
             try:
                 remote = _remote_tar_set(
                     hf_up["repo_id"],
@@ -632,7 +844,7 @@ def main() -> None:
                 remote = set()
 
         try:
-            one_cycle(config_path, cfg, state, remote, hf_token=hf_tok)
+            one_cycle(config_path, cfg, state, remote, hf_token=hf_tok, mode=watchdog_mode)
         except Exception as e:
             print(f"[WATCHDOG] cycle error: {e}", flush=True)
             import traceback
@@ -645,11 +857,29 @@ def main() -> None:
             1 for s in state["shards"].values() if s.get("download") in ("done", "not_required")
         )
         done_re = sum(1 for s in state["shards"].values() if s.get("render_encode") == "done")
-        done_up = sum(1 for s in state["shards"].values() if s.get("upload") in ("done", "skipped"))
-        print(
-            f"[WATCHDOG] summary shards: download_ok={done_dl} encode_ok={done_re} upload_ok_or_skip={done_up} / {len(state['shards'])}",
-            flush=True,
+        done_ro = sum(
+            1 for s in state["shards"].values() if s.get("render_encode") == "render_only_done"
         )
+        done_up = sum(1 for s in state["shards"].values() if s.get("upload") in ("done", "skipped"))
+        if watchdog_mode == "render_only":
+            print(
+                f"[WATCHDOG] summary (render-only): download_ok={done_dl} "
+                f"render_only_done={done_ro} encode_done={done_re} "
+                f"upload_skipped_or_done={done_up} / {len(state['shards'])}",
+                flush=True,
+            )
+        elif watchdog_mode == "encode_only":
+            print(
+                f"[WATCHDOG] summary (encode-only): download_ok={done_dl} encode_done={done_re} "
+                f"upload_ok_or_skip={done_up} / {len(state['shards'])}",
+                flush=True,
+            )
+        else:
+            print(
+                f"[WATCHDOG] summary shards: download_ok={done_dl} encode_ok={done_re} "
+                f"upload_ok_or_skip={done_up} / {len(state['shards'])}",
+                flush=True,
+            )
 
         if args.once:
             break

@@ -120,3 +120,5 @@ pipeline:
     download_retries: 5
     shards_only_download: true
     manifest_only_download: false
+    # Render-only watchdog: delete shards/github/<stem>.tar.zst once all mesh.ply exist (saves disk).
+    delete_source_shard_tar_after_render: false
