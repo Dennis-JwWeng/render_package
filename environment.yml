@@ -1,0 +1,57 @@
+# Conda environment for the Blender batch-render pipeline.
+#
+# Scope:
+#   - HOST side : render_only.py + dataset_toolkits/utils.py  (Python + numpy)
+#   - SYSTEM libs: X11 / OpenGL shared libraries bundled in the env so
+#     Blender 3.5.1 can start on machines that lack them system-wide.
+#     Prepend $CONDA_PREFIX/lib to LD_LIBRARY_PATH when activating the env
+#     (e.g. export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH) so
+#     Blender finds X11/GL.
+#
+# NOTE: Blender 3.5.1 ships its own embedded Python 3.10 + its own
+#       copies of most third-party libs.  The packages below only
+#       fill gaps for X11/GL which Blender dynamically links at
+#       startup and does NOT bundle itself.
+#
+# Usage:
+#   conda env create -f environment.yml
+#   conda activate render
+#   python render_only.py --src_base /path/to/glbs --out_base /path/to/out \
+#       --num_workers 4 --num_gpus 4
+
+name: render
+
+channels:
+  - conda-forge
+  - defaults
+
+dependencies:
+  # ── interpreter ────────────────────────────────────────────────────
+  - python=3.10             # matches Blender 3.5.1's embedded Python
+
+  # ── host-process runtime ────────────────────────────────────────────
+  - numpy>=1.24,<2.0        # render_only.py + dataset_toolkits/utils.py
+  - pip
+
+  # ── X11 / OpenGL system libs (portable, no root needed) ────────────
+  # conda-forge 里 X11 系列包名均带 xorg- 前缀
+  # Core X11 stack
+  - xorg-libx11             # libX11.so.6       – base Xlib
+  - xorg-libxext            # libXext.so.6      – X11 extensions
+  - xorg-libxcb             # libxcb.so.1       – XCB transport layer
+  - xorg-libxau             # libXau.so.6       – X authority (xcb dep)
+  - xorg-libxdmcp           # libXdmcp.so.6     – XDMCP (xcb dep)
+
+  # The five libs the user reported missing
+  - xorg-libxfixes          # libXfixes.so.3
+  - xorg-libxi              # libXi.so.6        – X Input extension
+  - xorg-libxxf86vm         # libXxf86vm.so.1   – XFree86-VidMode
+  - xorg-libxrender         # libXrender.so.1   – X Render extension
+  - libgl                   # libGL.so.1        – OpenGL (Mesa stub/impl)
+
+  # Additional GL / input libs Blender links at startup
+  - libglu                  # libGLU.so.1       – GL Utilities
+  - libxkbcommon            # libxkbcommon.so.0 – keyboard (Wayland compat)
+  - xorg-libxinerama        # libXinerama.so.1  – multi-monitor
+  - xorg-libxrandr          # libXrandr.so.2    – RandR (display resize)
+  - xorg-libxcursor         # libXcursor.so.1   – cursor theming

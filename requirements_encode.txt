@@ -1,0 +1,37 @@
+# Unified encoding environment requirements
+# Install: pip install -r requirements_encode.txt
+
+# PyTorch (adjust cu version for your CUDA)
+torch>=2.5.0
+torchvision>=0.20.0
+
+# Sparse convolutions (used by both TRELLIS and UniLat)
+spconv-cu124==2.3.8
+
+# DINOv2 feature extraction
+# (model code loaded from third_party/dinov2, weights from weights/dinov2/)
+
+# 3D / mesh
+open3d>=0.18.0
+plyfile>=1.0
+scipy>=1.10
+
+# Image processing
+Pillow>=10.0
+tqdm>=4.60
+
+# Model I/O
+safetensors>=0.4
+numpy>=1.24
+
+# Config
+pyyaml>=6.0
+
+# Projection utils (pip install; or loaded from TRELLIS source)
+utils3d @ git+https://github.com/EasternJournalist/utils3d.git@7c29411
+
+# Render stage (optional, only needed for render_github.py)
+zstandard>=0.21
+
+# Flash attention (optional, improves UniLat speed; install separately)
+# pip install flash-attn --no-build-isolation

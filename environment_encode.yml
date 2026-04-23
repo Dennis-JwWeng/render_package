@@ -1,0 +1,70 @@
+# Minimal conda environment for the 3D latent encoding pipeline.
+#
+# Reproduces the subset of vinedresser3d needed for:
+#   encoders/ (DINOv2 + UniLat + TRELLIS SLAT + TRELLIS SS)
+#
+# Prerequisites:
+#   - NVIDIA driver ≥ 525 (CUDA 12.x compatible)
+#   - conda / mamba
+#
+# Install:
+#   conda env create -f environment_encode.yml
+#   conda activate encode
+#
+# Post-install (flash-attn needs separate build):
+#   pip install flash-attn==2.7.3 --no-build-isolation
+#
+# Usage:
+#   conda activate encode
+#   SPCONV_ALGO=native python encode_shard.py --config config/default.yaml --shard_dir ...
+
+name: encode
+
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+
+dependencies:
+  # ── Interpreter ───────────────────────────────────────────────
+  - python=3.10
+
+  # ── CUDA toolkit (runtime + nvcc for flash-attn build) ───────
+  - cuda-cudart=12.4
+  - cuda-nvcc=12.4
+
+  # ── Core ML ──────────────────────────────────────────────────
+  - pytorch=2.5.0=*cu124*
+  - torchvision=0.20.0=*cu124*
+  - numpy>=1.24,<3
+  - scipy>=1.10
+
+  # ── Utilities ─────────────────────────────────────────────────
+  - pillow>=10.0
+  - tqdm>=4.60
+  - pyyaml>=6.0
+
+  # ── pip-only packages ─────────────────────────────────────────
+  - pip
+  - pip:
+    # Sparse convolutions (TRELLIS + UniLat)
+    - spconv-cu124==2.3.8
+    # Mesh voxelization
+    - open3d>=0.18.0
+    # Weight I/O
+    - safetensors>=0.4
+    # PLY mesh I/O
+    - plyfile>=1.0
+    # Camera projection utils (pinned commit)
+    - utils3d @ git+https://github.com/EasternJournalist/utils3d.git@7c29411
+    # Efficient attention (DINOv2 backbone)
+    - xformers==0.0.28.post2
+    # .tar.zst decompression (render stage, optional for encode-only)
+    - zstandard>=0.21
+    # einops (used by UniLat/TRELLIS internally)
+    - einops>=0.7
+
+    # ── flash-attn: MUST be installed separately ────────────────
+    # pip install flash-attn==2.7.3 --no-build-isolation
+    # (cannot be listed here because it needs torch to be installed first)

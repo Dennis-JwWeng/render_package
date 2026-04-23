@@ -1,0 +1,110 @@
+# ─── Trellis500K GitHub archives-6: first 100 shards (tar indices 0–99) ───
+#
+# Data root (all local I/O under this tree):
+#   /mnt/hdd2/unified_model/data/datasets/trellis500k-github-archives-6/
+#
+# Download (HF source):
+#   Repo: DennisWeng06/trellis500k-github-archives-6
+#   Mirror listing uses path: datasets/<user>/<repo> (see download_trellis.py).
+#
+# After download, layout on disk matches HF paths, e.g.:
+#   <data_root>/manifest/...
+#   <data_root>/shards/github/*.tar.zst
+#
+# Upload: python upload_hf_encoded_shards.py --config <this file> --all-verified
+#   Needs HUGGINGFACE_HUB_TOKEN and hf.upload.enabled: true (or --force).
+
+# ─── Paths (explicit: encoders/config.py defaults assume archives-5 under data_root) ───
+paths:
+  data_root: /mnt/hdd2/unified_model/data/datasets/trellis500k-github-archives-6
+  shard_dir: /mnt/hdd2/unified_model/data/datasets/trellis500k-github-archives-6/shards/github
+  render_dir: /mnt/hdd2/unified_model/data/datasets/trellis500k-github-archives-6/github/render
+  raw_dir: /mnt/hdd2/unified_model/data/datasets/trellis500k-github-archives-6/github/raw
+  render_tmp: /mnt/hdd2/unified_model/data/datasets/trellis500k-github-archives-6/github/.render_tmp
+  blender_bin: auto
+
+  # Staging: one compressed tarball per shard before HF upload (tar + zstd).
+  pack_staging_dir: /mnt/hdd2/unified_model/data/datasets/trellis500k-github-archives-6/github/pack_for_upload
+
+# ─── Hugging Face: source dataset (download) ───
+hf:
+  download:
+    repo_id: DennisWeng06/trellis500k-github-archives-6
+    # CLI equivalent: suffix=6, pattern substitutes {} → 6
+    repo_pattern: datasets/DennisWeng06/trellis500k-github-archives-{}
+    suffix: 6
+    shard_index_start: 0   # inclusive, 0-based
+    shard_index_end: 99    # inclusive → 100 tar shards
+    mirror: https://hf-mirror.com
+    # download_trellis writes under dest preserving paths (manifest/ + shards/...)
+    dest: /mnt/hdd2/unified_model/data/datasets/trellis500k-github-archives-6
+
+  upload:
+    enabled: false
+    # Processed outputs (packed shards); naming aligned with trellis500k-github-archives-6
+    repo_id: Dennis0626/trellis500k-github-archives-6-processed
+    repo_type: dataset
+    revision: main
+    # Hub layout: github/render/<shard_id>.tar.zst
+    path_in_repo: github/render
+    archive:
+      format: tar_zst
+      zstd_level: 10
+      include:
+        - latents
+        - transforms.json
+        - mesh.ply
+      exclude_globs:
+        - "images/**/*.png"
+    verify_local_archive_before_upload: true
+    verify_remote_after_upload: true
+    delete_local_archive_after_success: true
+    delete_local_when_remote_exists: true
+
+weights:
+  unilat_encoder: weights/unilat/encoder
+  slat_encoder: weights/trellis/slat_enc
+  ss_encoder: weights/trellis/ss_enc
+  dinov2: weights/dinov2/dinov2_vitl14_reg4_pretrain.pth
+  dinov2_repo: third_party/dinov2
+
+third_party:
+  trellis: third_party/trellis
+  unilat3d: third_party/unilat3d
+
+stages:
+  render: true
+  dino_features: true
+  unilat: true
+  slat: true
+  ss: true
+  save_dino_features: false
+
+gpus:
+  render: auto
+  encode: auto
+
+render:
+  num_views: 40
+  resolution: 512
+  num_workers: 4
+
+encode:
+  device: cuda:0
+  batch_size: 8
+  max_voxels: 32768
+  subsample_seed: 0
+  max_views: -1
+
+pipeline:
+  # Must match shard_index_end - shard_index_start + 1
+  num_shards: 100
+  sleep_minutes: 30
+  no_delete_shard: true
+  delete_source_shard_tar: true
+  watchdog:
+    interval_seconds: 600
+    download_workers: 4
+    download_retries: 5
+    shards_only_download: true
+    manifest_only_download: false

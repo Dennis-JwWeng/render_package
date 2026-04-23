@@ -1,0 +1,33 @@
+# Conda / venv (multi-gigabyte)
+envs/
+
+# Blender bundle
+blender-3.5.1-linux-x64/
+
+# Model weights (not in repo — use HF / pack.sh / separate release)
+weights/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Logs / temp
+*.log
+*.tmp
+.render_tmp/
+
+# Local data paths (if symlinked or copied here)
+.github_cache/

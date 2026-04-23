@@ -1,0 +1,110 @@
+# ─── Render-Encode Pipeline Config ───
+# Canonical dataset root for DennisWeng06/trellis500k-github-archives-6:
+#   /mnt/hdd2/unified_model/data/datasets/trellis500k-github-archives-6
+# Subdirs (HF download layout + pipeline):
+#   manifest/  shards/github/*.tar.zst  github/raw  github/render  github/.render_tmp
+
+paths:
+  data_root: /mnt/hdd2/unified_model/data/datasets/trellis500k-github-archives-6
+  shard_dir: /mnt/hdd2/unified_model/data/datasets/trellis500k-github-archives-6/shards/github
+  render_dir: /mnt/hdd2/unified_model/data/datasets/trellis500k-github-archives-6/github/render
+  raw_dir: /mnt/hdd2/unified_model/data/datasets/trellis500k-github-archives-6/github/raw
+  render_tmp: /mnt/hdd2/unified_model/data/datasets/trellis500k-github-archives-6/github/.render_tmp
+  pack_staging_dir: /mnt/hdd2/unified_model/data/datasets/trellis500k-github-archives-6/github/pack_for_upload
+  blender_bin: auto         # {RENDER_PKG}/blender-3.5.1-linux-x64/blender
+
+# Hugging Face: download knobs mirror download_trellis.py; upload used by upload_hf_encoded_shards.py
+# Auth: export HUGGINGFACE_HUB_TOKEN=hf_...
+hf:
+  download:
+    repo_id: DennisWeng06/trellis500k-github-archives-6
+    repo_pattern: datasets/DennisWeng06/trellis500k-github-archives-{}
+    suffix: 6
+    shard_index_start: 0
+    shard_index_end: 99
+    mirror: https://hf-mirror.com
+    dest: /mnt/hdd2/unified_model/data/datasets/trellis500k-github-archives-6
+  upload:
+    enabled: false          # set true after token (HUGGINGFACE_HUB_TOKEN) + repo exist
+    # Output dataset (aligned name: archives-6 → archives-6-processed)
+    repo_id: Dennis0626/trellis500k-github-archives-6-processed
+    repo_type: dataset
+    revision: main
+    # Hub layout: github/render/*.tar.zst (unchanged by repo rename)
+    path_in_repo: github/render
+    archive:
+      format: tar_zst
+      zstd_level: 10
+      include:
+        - latents
+        - transforms.json
+        - mesh.ply
+      exclude_globs:
+        - "images/**/*.png"
+    # After encode_done pack: verify tar.zst readable → upload → verify Hub size → delete local
+    verify_local_archive_before_upload: true
+    verify_remote_after_upload: true
+    delete_local_archive_after_success: true
+    # If Hub already has the file: compare sizes then remove duplicate local pack
+    delete_local_when_remote_exists: true
+
+# Weights: relative to render_package/ root, or absolute paths.
+# Prefix convention: loads {prefix}.json + {prefix}.safetensors
+weights:
+  unilat_encoder: weights/unilat/encoder
+  slat_encoder: weights/trellis/slat_enc
+  ss_encoder: weights/trellis/ss_enc
+  dinov2: weights/dinov2/dinov2_vitl14_reg4_pretrain.pth
+  dinov2_repo: third_party/dinov2
+
+# Third-party model code (relative or absolute)
+third_party:
+  trellis: third_party/trellis
+  unilat3d: third_party/unilat3d
+
+# Stage switches (set false to skip)
+stages:
+  render: true
+  dino_features: true       # Stage 1: shared voxelize + DINOv2
+  unilat: true              # Stage 2a: UniLat encoder
+  slat: true                # Stage 2b: TRELLIS SLAT encoder
+  ss: true                  # Stage 2c: TRELLIS SS encoder
+  save_dino_features: false  # keep dino_features.npz intermediate
+
+# GPU allocation
+# In encode-only mode, all GPUs are used for encoding.
+# In pipeline mode, render and encode GPUs should ideally not overlap.
+# "auto" = use all detected GPUs.  Or specify list: [0, 1, 2, 3]
+gpus:
+  render: auto
+  encode: auto
+
+# Render settings
+render:
+  num_views: 40
+  resolution: 512
+  num_workers: 4
+
+# Encode settings
+encode:
+  device: cuda:0            # overridden per-worker in multi-GPU mode
+  batch_size: 8             # DINOv2 views per forward pass
+  max_voxels: 32768         # subsample if mesh too dense
+  subsample_seed: 0
+  max_views: -1             # -1 = use all rendered views
+
+# Pipeline control
+pipeline:
+  num_shards: 100
+  sleep_minutes: 30
+  no_delete_shard: true
+  # After encode+upload verified (or encode-only if upload disabled): delete shards/github/*.tar.zst
+  delete_source_shard_tar: true
+  # pipeline_watchdog.py: loop + state file (default <data_root>/github/pipeline_state.json)
+  watchdog:
+    interval_seconds: 600
+    download_workers: 4
+    download_retries: 5
+    shards_only_download: true   # true = only .tar.zst (matches run_pipeline); false + manifest_only_download true = manifest only
+    manifest_only_download: false
+    # state_file: null           # optional absolute path; default uses data_root/github/pipeline_state.json
