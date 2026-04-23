@@ -288,6 +288,60 @@ memory contention. In encode-only mode, all GPUs are used for encoding.
 **Resume:** Both stages are fully resumable. On restart, completed shards are
 detected by scanning for output files and skipped automatically.
 
+### 7. Watchdog, upload, and upload record (recommended for GitHub tar shards)
+
+Use one YAML (e.g. `config/trellis_github_archives_6_first100.yaml`) for paths, `hf.download` / `hf.upload`, and GPU pool. Optional secrets: create `config/<same_basename>.local.yaml` with `hf.upload.token` (gitignored); or set `HUGGINGFACE_HUB_TOKEN` / `HF_TOKEN`.
+
+**Start the watchdog (loop every `pipeline.watchdog.interval_seconds`):**
+
+```bash
+cd /path/to/render_package
+source envs/env/bin/activate
+export SPCONV_ALGO=native
+# If /tmp is full, point temp at your data mount (matches paths.render_tmp in YAML):
+export TMPDIR=/path/to/<data_root>/github/.render_tmp
+mkdir -p "$TMPDIR"
+
+python pipeline_watchdog.py --config config/trellis_github_archives_6_first100.yaml
+```
+
+**Single cycle then exit (smoke test or cron):**
+
+```bash
+cd /path/to/render_package && source envs/env/bin/activate
+export SPCONV_ALGO=native
+python pipeline_watchdog.py --config config/trellis_github_archives_6_first100.yaml --once
+```
+
+**Background + log file on the data disk:**
+
+```bash
+cd /path/to/render_package && source envs/env/bin/activate
+export SPCONV_ALGO=native
+export TMPDIR=/path/to/<data_root>/github/.render_tmp
+mkdir -p "$TMPDIR"
+nohup python pipeline_watchdog.py --config config/trellis_github_archives_6_first100.yaml \
+  >> /path/to/<data_root>/github/watchdog.log 2>&1 &
+```
+
+**Pack and upload strict `encode_done` shards to Hugging Face** (`hf.upload.enabled: false` still works with `--force`):
+
+```bash
+cd /path/to/render_package && source envs/env/bin/activate
+python upload_hf_encoded_shards.py \
+  --config config/trellis_github_archives_6_first100.yaml \
+  --all-verified --force
+```
+
+**Refresh `upload_record.json` (Hub listing vs local encode_done in shard range):**
+
+```bash
+cd /path/to/render_package && source envs/env/bin/activate
+python refresh_upload_record.py --config config/trellis_github_archives_6_first100.yaml
+```
+
+More detail (tmux, state files, retry policy): see **`RUNBOOK.md`**.
+
 ---
 
 ## Encoding Stages Detail
