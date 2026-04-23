@@ -165,7 +165,7 @@ def run_encode_shard_subprocess(config_path: str, shard_render_dir: str, cuda_vi
         "from encoders.config import load_config;"
         "from encoders import encode_shard, ALL_STAGES;"
         f"cfg=load_config({config_path!r});"
-        "st=[s for s in ALL_STAGES if cfg.get('stages',{{}}).get(s,True)];"
+        f"st=[s for s in ALL_STAGES if cfg.get('stages',{{}}).get(s,True)];"
         f"encode_shard({shard_render_dir!r}, cfg, st)"
     )
     subprocess.check_call([sys.executable, "-c", code])
