@@ -49,6 +49,8 @@ def build_views(num_views, seed):
 def render_worker(wid, gpu_id, tasks, blender_bin, num_views, out_base, use_cpu=False):
     n_ok, n_fail, n_skip = 0, 0, 0
     device_tag = "CPU" if use_cpu else f"GPU{gpu_id}"
+    out_base = os.path.abspath(out_base)
+    os.makedirs(out_base, exist_ok=True)
     for gi, (glb_path, shard, stem) in enumerate(tasks):
         out_dir = os.path.join(out_base, shard, stem)
         done_marker = os.path.join(out_dir, "mesh.ply")
@@ -58,7 +60,7 @@ def render_worker(wid, gpu_id, tasks, blender_bin, num_views, out_base, use_cpu=
 
         print(f"[R{wid}:{device_tag}] ({gi+1}/{len(tasks)}) {shard}/{stem}", flush=True)
         view_seed = int(hashlib.md5(stem.encode()).hexdigest()[:8], 16) % (2**31) or 1
-        render_tmp = tempfile.mkdtemp(prefix=f"render_{stem[:8]}_")
+        render_tmp = tempfile.mkdtemp(prefix=f"render_{stem[:8]}_", dir=out_base)
         try:
             views = build_views(num_views, view_seed)
             args = [
@@ -74,6 +76,9 @@ def render_worker(wid, gpu_id, tasks, blender_bin, num_views, out_base, use_cpu=
                 args.append("--use_cpu")
             env = os.environ.copy()
             env["CUDA_VISIBLE_DEVICES"] = "" if use_cpu else str(gpu_id)
+            env["TMPDIR"] = render_tmp
+            env["TEMP"] = render_tmp
+            env["TMP"] = render_tmp
             ret = call(args, stdout=open(os.devnull, 'w'), stderr=open(os.devnull, 'w'), env=env)
             tj = os.path.join(render_tmp, "transforms.json")
             mesh = os.path.join(render_tmp, "mesh.ply")

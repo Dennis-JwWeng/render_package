@@ -2,7 +2,7 @@
 """
 Hugging Face dataset utilities: inspect uploads, rename (move) a repo.
 
-Authentication for private repos or rename: set HUGGINGFACE_HUB_TOKEN (never commit tokens).
+Auth: HUGGINGFACE_HUB_TOKEN / HF_TOKEN, or ``stats --config`` to use hf.upload.token from ``<config>.local.yaml`` (via encoders.config).
 
 Examples:
   # Count / size of .tar.zst under a path prefix (default: whole tree)
@@ -31,7 +31,16 @@ def _api_token() -> str | None:
 def cmd_stats(args: argparse.Namespace) -> None:
     from huggingface_hub import HfApi
 
-    api = HfApi(token=_api_token())
+    token = _api_token()
+    if getattr(args, "config", None):
+        RENDER_PKG = os.path.dirname(os.path.abspath(__file__))
+        if RENDER_PKG not in sys.path:
+            sys.path.insert(0, RENDER_PKG)
+        from encoders.config import hf_hub_token, load_config
+
+        token = hf_hub_token(load_config(args.config))
+
+    api = HfApi(token=token)
     prefix = (args.path_prefix or "").strip().strip("/")
     tree_path = prefix if prefix else None
 
@@ -102,6 +111,12 @@ def main() -> None:
         type=str,
         default="",
         help="e.g. github/render — only list this subtree",
+    )
+    s.add_argument(
+        "--config",
+        type=str,
+        default="",
+        help="YAML (with optional .local.yaml): HF token from hf.upload.token / env via encoders.config",
     )
     s.set_defaults(func=cmd_stats)
 

@@ -31,3 +31,6 @@ build/
 
 # Local data paths (if symlinked or copied here)
 .github_cache/
+
+# Local YAML overrides (secrets: hf.upload.token)
+*.local.yaml

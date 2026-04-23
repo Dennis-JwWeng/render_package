@@ -8,8 +8,18 @@ State file (default: <data_root>/github/pipeline_state.json):
   - Tracks per-shard download / render_encode / upload and last_error
   - Reconciles with disk + Hub when possible
 
+Download: only when disk says the shard still needs a local .tar.zst for decompress/render
+  (partial / not started). encode_done and render_done skip download; render_done runs encode only.
+  Set pipeline.watchdog.prefetch_downloads: true for bulk parallel prefetch at cycle start.
+
+Soft failures: pipeline.watchdog.incomplete_encode_as (error|partial) and max_encode_passes (-1=unlimited)
+  control whether incomplete encode is a hard error and how many encode runs to attempt per shard.
+
+Encode: uses all IDs in gpus.encode (same worker pool as run_pipeline.py). Prefer gpus.pool in YAML so
+  render and encode share one list (full GPUs for Blender, then the same GPUs for encode).
+
 Usage:
-  export HUGGINGFACE_HUB_TOKEN=...   # if upload enabled
+  export HUGGINGFACE_HUB_TOKEN=...   # if upload enabled (or hf.upload.token in <config>.local.yaml)
   export SPCONV_ALGO=native
   python pipeline_watchdog.py --config config/default.yaml
 
@@ -30,6 +40,8 @@ from typing import Any
 RENDER_PKG = os.path.dirname(os.path.abspath(__file__))
 if RENDER_PKG not in sys.path:
     sys.path.insert(0, RENDER_PKG)
+
+from encoders.config import hf_hub_token  # noqa: E402
 
 STATE_VERSION = 1
 STOP = False
@@ -74,6 +86,7 @@ def _shard_entry() -> dict[str, Any]:
         "render_encode": "pending",
         "upload": "pending",
         "last_error": None,
+        "encode_passes": 0,
     }
 
 
@@ -100,8 +113,10 @@ def validate_config(cfg: dict, config_path: str) -> None:
             raise SystemExit(f"Blender not found at paths.blender_bin: {b}")
     up = (cfg.get("hf") or {}).get("upload") or {}
     if up.get("enabled", False):
-        if not (os.environ.get("HUGGINGFACE_HUB_TOKEN") or os.environ.get("HF_TOKEN")):
-            raise SystemExit("hf.upload.enabled but HUGGINGFACE_HUB_TOKEN / HF_TOKEN not set")
+        if not hf_hub_token(cfg):
+            raise SystemExit(
+                "hf.upload.enabled but no token: set HUGGINGFACE_HUB_TOKEN / HF_TOKEN or hf.upload.token in .local.yaml"
+            )
         if not up.get("repo_id"):
             raise SystemExit("hf.upload.repo_id empty")
 
@@ -156,19 +171,132 @@ def run_download_phase(cfg: dict) -> None:
         dlt.MIRROR = prev
 
 
-def run_encode_shard_subprocess(config_path: str, shard_render_dir: str, cuda_visible: str) -> None:
-    code = (
-        "import os,sys;"
-        f"os.environ['CUDA_VISIBLE_DEVICES']={cuda_visible!r};"
-        "os.environ.setdefault('SPCONV_ALGO','native');"
-        f"sys.path.insert(0,{RENDER_PKG!r});"
-        "from encoders.config import load_config;"
-        "from encoders import encode_shard, ALL_STAGES;"
-        f"cfg=load_config({config_path!r});"
-        f"st=[s for s in ALL_STAGES if cfg.get('stages',{{}}).get(s,True)];"
-        f"encode_shard({shard_render_dir!r}, cfg, st)"
+def download_one_shard_tar(cfg: dict, stem: str) -> bool:
+    """Fetch shards/github/<stem>.tar.zst when missing (one file, mirror + single worker)."""
+    hf_dl = cfg["hf"]["download"]
+    wd = cfg.get("pipeline", {}).get("watchdog", {}) or {}
+    repo = hf_dl["repo_pattern"].format(hf_dl["suffix"])
+    dest = hf_dl.get("dest") or cfg["paths"]["data_root"]
+    mirror = hf_dl.get("mirror", "https://hf-mirror.com")
+    retries = int(wd.get("download_retries", 5))
+    import download_trellis as dlt
+
+    prev = dlt.MIRROR
+    dlt.MIRROR = mirror
+    try:
+        return dlt.download_shard_tar(repo, dest, stem, retries=retries, quiet=False)
+    finally:
+        dlt.MIRROR = prev
+
+
+def run_encode_shard_multigpu(
+    config_path: str,
+    shard_render_dir: str,
+    encode_gpus: list[int],
+    *,
+    prior_encode_passes: int = 0,
+    encode_retry_policy: str = "any_incomplete",
+) -> None:
+    """Encode one shard directory using one worker process per GPU (shared task queue)."""
+    from collections import Counter
+    from multiprocessing import Process, Queue
+
+    from encoders import ALL_STAGES
+    from encoders.config import load_config
+    from run_pipeline import _SENTINEL, _encode_worker, object_encode_complete, object_needs_encode
+
+    if not os.path.isdir(shard_render_dir):
+        print(f"[WATCHDOG] Encode skipped: missing render dir {shard_render_dir}", flush=True)
+        return
+
+    cfg = load_config(config_path)
+    stages = [s for s in ALL_STAGES if cfg.get("stages", {}).get(s, True)]
+    gpus = list(encode_gpus) if encode_gpus else [0]
+
+    objects = sorted(
+        [
+            os.path.join(shard_render_dir, d)
+            for d in os.listdir(shard_render_dir)
+            if os.path.isdir(os.path.join(shard_render_dir, d))
+            and os.path.isfile(os.path.join(shard_render_dir, d, "mesh.ply"))
+        ]
     )
-    subprocess.check_call([sys.executable, "-c", code])
+    if not objects:
+        print(f"[WATCHDOG] No objects with mesh.ply under {shard_render_dir}", flush=True)
+        return
+
+    pol = (encode_retry_policy or "any_incomplete").strip().lower()
+    if pol not in ("any_incomplete", "never_started_only"):
+        pol = "any_incomplete"
+    todo = [
+        p
+        for p in objects
+        if object_needs_encode(
+            p,
+            stages,
+            cfg,
+            prior_shard_encode_passes=prior_encode_passes,
+            retry_policy=pol,
+        )
+    ]
+    stem = os.path.basename(shard_render_dir)
+    if not todo:
+        n_inc = sum(1 for p in objects if not object_encode_complete(p, stages, cfg))
+        if n_inc == 0:
+            print(
+                f"[WATCHDOG] Encode shard {stem}: all {len(objects)} objects already complete (skipped worker pool)",
+                flush=True,
+            )
+        else:
+            print(
+                f"[WATCHDOG] Encode shard {stem}: {n_inc} object(s) still incomplete but none queued "
+                f"(retry policy={pol!r}, prior_passes={prior_encode_passes}; skipped worker pool)",
+                flush=True,
+            )
+        return
+
+    print(
+        f"[WATCHDOG] Encode shard {stem}: {len(todo)}/{len(objects)} objects need work on GPUs {gpus}",
+        flush=True,
+    )
+
+    encode_queue: Queue = Queue()
+    result_queue: Queue = Queue()
+    for scene_dir in todo:
+        encode_queue.put(scene_dir)
+    encode_queue.put(_SENTINEL)
+
+    workers: list[Process] = []
+    for gid in gpus:
+        p = Process(
+            target=_encode_worker,
+            args=(gid, encode_queue, result_queue, cfg, stages),
+            daemon=True,
+        )
+        p.start()
+        workers.append(p)
+
+    done_workers = 0
+    counts: Counter = Counter()
+    while done_workers < len(gpus):
+        result = result_queue.get()
+        if result.get("_done"):
+            done_workers += 1
+            continue
+        for stage in ALL_STAGES:
+            st = result.get(stage)
+            if st in ("ok", "skip", "fail"):
+                counts[f"{stage}_{st}"] += 1
+
+    for p in workers:
+        p.join(timeout=60)
+
+    for stage in stages:
+        ok = counts.get(f"{stage}_ok", 0)
+        sk = counts.get(f"{stage}_skip", 0)
+        fl = counts.get(f"{stage}_fail", 0)
+        if ok + sk + fl > 0:
+            print(f"[WATCHDOG]   {stage}: ok={ok} skip={sk} fail={fl}", flush=True)
 
 
 def run_upload_subprocess(config_path: str, shard_stem: str) -> None:
@@ -179,24 +307,43 @@ def run_upload_subprocess(config_path: str, shard_stem: str) -> None:
     )
 
 
-def _classify_all(render_dir: str, stages: list[str], cfg: dict) -> dict[str, str]:
+def _classify_all(
+    render_dir: str,
+    stages: list[str],
+    cfg: dict,
+    state: dict[str, Any] | None = None,
+) -> dict[str, str]:
     from run_pipeline import _classify_shards
 
-    return _classify_shards(render_dir, stages, cfg)
+    shard_passes: dict[str, int] | None = None
+    if state is not None:
+        shard_passes = {
+            k: int(v.get("encode_passes", 0))
+            for k, v in state.get("shards", {}).items()
+        }
+    return _classify_shards(render_dir, stages, cfg, shard_encode_passes=shard_passes)
 
 
-def _remote_tar_set(repo_id: str, repo_type: str, path_in_repo: str) -> set[str]:
+def _remote_tar_set(
+    repo_id: str, repo_type: str, path_in_repo: str, token: str | None = None
+) -> set[str]:
     from huggingface_hub import HfApi
 
     prefix = path_in_repo.strip("/") + "/"
     names: set[str] = set()
-    for p in HfApi().list_repo_files(repo_id, repo_type=repo_type):
+    for p in HfApi(token=token).list_repo_files(repo_id, repo_type=repo_type):
         if p.startswith(prefix) and p.endswith(".tar.zst"):
             names.add(os.path.basename(p).replace(".tar.zst", ""))
     return names
 
 
-def one_cycle(config_path: str, cfg: dict, state: dict[str, Any], remote_shards: set[str] | None) -> None:
+def one_cycle(
+    config_path: str,
+    cfg: dict,
+    state: dict[str, Any],
+    remote_shards: set[str] | None,
+    hf_token: str | None = None,
+) -> None:
     paths = cfg["paths"]
     shard_dir = paths["shard_dir"]
     render_dir = paths["render_dir"]
@@ -211,19 +358,27 @@ def one_cycle(config_path: str, cfg: dict, state: dict[str, Any], remote_shards:
     stages = [s for s in ALL_STAGES if cfg.get("stages", {}).get(s, True)]
 
     stems = expected_stems(cfg)
-    classify = _classify_all(render_dir, stages, cfg)
+    classify = _classify_all(render_dir, stages, cfg, state)
 
     render_gpus = cfg["gpus"]["render"]
     encode_gpus = cfg["gpus"]["encode"]
     num_workers = int(cfg.get("render", {}).get("num_workers", 4))
     num_views = int(cfg.get("render", {}).get("num_views", 40))
     no_delete_shard = bool(cfg.get("pipeline", {}).get("no_delete_shard", True))
+    wd = cfg.get("pipeline", {}).get("watchdog", {}) or {}
+    incomplete_as = (wd.get("incomplete_encode_as") or "error").strip().lower()
+    if incomplete_as not in ("error", "partial"):
+        incomplete_as = "error"
+    max_encode_passes = int(wd.get("max_encode_passes", -1))
+    encode_retry_policy = (wd.get("encode_retry_objects") or "any_incomplete").strip().lower()
+    if encode_retry_policy not in ("any_incomplete", "never_started_only"):
+        encode_retry_policy = "any_incomplete"
 
     import render_github as rg
     from huggingface_hub import HfApi
     from upload_hf_encoded_shards import _remote_size, delete_source_shard_tar_if_enabled
 
-    hf_api = HfApi()
+    hf_api = HfApi(token=hf_token)
 
     for stem in stems:
         if STOP:
@@ -231,14 +386,44 @@ def one_cycle(config_path: str, cfg: dict, state: dict[str, Any], remote_shards:
         zst = os.path.join(shard_dir, stem + ".tar.zst")
         ent = state["shards"].setdefault(stem, _shard_entry())
 
-        if os.path.isfile(zst) and os.path.getsize(zst) > 0:
-            ent["download"] = "done"
-        else:
-            ent["download"] = "pending"
-            ent["last_error"] = "missing_local_tar"
+        if ent.get("skip_reason") == "empty_tar_no_models":
+            print(
+                f"[WATCHDOG] {stem}: skip (tar produced no models last time; clear shard in pipeline_state to retry)",
+                flush=True,
+            )
             continue
 
         st = classify.get(stem)
+        if st == "encode_done":
+            ent["encode_passes"] = 0
+            ent["last_error"] = None
+            ent.pop("skip_reason", None)
+
+        # Tar is only required to decompress + render. encode_done / render_done use render_dir on disk.
+        needs_tar = st not in ("encode_done", "render_done")
+
+        if needs_tar:
+            if not (os.path.isfile(zst) and os.path.getsize(zst) > 0):
+                print(f"[WATCHDOG] {stem}: download .tar.zst (needed for decompress/render)", flush=True)
+                if not download_one_shard_tar(cfg, stem):
+                    ent["download"] = "pending"
+                    ent["last_error"] = "download_failed"
+                    continue
+                if not (os.path.isfile(zst) and os.path.getsize(zst) > 0):
+                    ent["download"] = "pending"
+                    ent["last_error"] = "missing_local_tar_after_download"
+                    continue
+            ent["download"] = "done"
+        else:
+            if os.path.isfile(zst) and os.path.getsize(zst) > 0:
+                ent["download"] = "done"
+            else:
+                ent["download"] = "not_required"
+            if st == "encode_done":
+                print(f"[WATCHDOG] {stem}: encode_done — skip tar download and render", flush=True)
+            else:
+                print(f"[WATCHDOG] {stem}: render_done — skip tar download; encode only", flush=True)
+
         if st == "encode_done":
             ent["render_encode"] = "done"
         elif st == "render_done":
@@ -249,26 +434,91 @@ def one_cycle(config_path: str, cfg: dict, state: dict[str, Any], remote_shards:
             ent["render_encode"] = "pending"
 
         if st != "encode_done":
+            passes = int(ent.get("encode_passes", 0))
+            if max_encode_passes >= 0 and passes >= max_encode_passes:
+                print(
+                    f"[WATCHDOG] {stem}: skip encode (encode_passes={passes} >= max_encode_passes={max_encode_passes}); "
+                    f"keeping existing outputs on disk",
+                    flush=True,
+                )
+                ent["render_encode"] = "partial"
+                ent["last_error"] = (
+                    None
+                    if incomplete_as == "partial"
+                    else "max_encode_passes_reached"
+                )
+                continue
+
             print(f"[WATCHDOG] {stem}: render+encode (status was {st})", flush=True)
             try:
-                rg.render_shard_from_zst(
-                    zst_path=zst,
-                    render_dir=render_dir,
-                    raw_dir=raw_dir,
-                    gpu_ids=render_gpus,
-                    num_workers=num_workers,
-                    num_views=num_views,
-                    render_tmp=render_tmp,
-                    no_delete_shard=no_delete_shard,
-                )
                 shard_render = os.path.join(render_dir, stem)
-                enc_gpu = str(encode_gpus[0]) if encode_gpus else "0"
-                run_encode_shard_subprocess(os.path.abspath(config_path), shard_render, enc_gpu)
-                classify = _classify_all(render_dir, stages, cfg)
+                if st == "render_done":
+                    if not os.path.isdir(shard_render):
+                        raise FileNotFoundError(f"render_done but render dir missing: {shard_render}")
+                else:
+                    rg.render_shard_from_zst(
+                        zst_path=zst,
+                        render_dir=render_dir,
+                        raw_dir=raw_dir,
+                        gpu_ids=render_gpus,
+                        num_workers=num_workers,
+                        num_views=num_views,
+                        render_tmp=render_tmp,
+                        no_delete_shard=no_delete_shard,
+                    )
+                if st != "render_done":
+                    if not os.path.isdir(shard_render):
+                        print(
+                            f"[WATCHDOG] {stem}: no render output (0 models or render failed); skip encode — "
+                            f"check tarball or clear skip_reason in state to retry",
+                            flush=True,
+                        )
+                        ent["skip_reason"] = "empty_tar_no_models"
+                        ent["render_encode"] = "partial"
+                        ent["last_error"] = (
+                            None if incomplete_as == "partial" else "empty_tar_no_models"
+                        )
+                        continue
+                    n_mesh = sum(
+                        1
+                        for d in os.listdir(shard_render)
+                        if os.path.isdir(os.path.join(shard_render, d))
+                        and os.path.isfile(os.path.join(shard_render, d, "mesh.ply"))
+                    )
+                    if n_mesh == 0:
+                        print(
+                            f"[WATCHDOG] {stem}: render dir has no mesh.ply; skip encode",
+                            flush=True,
+                        )
+                        ent["skip_reason"] = "empty_tar_no_models"
+                        ent["render_encode"] = "partial"
+                        ent["last_error"] = (
+                            None if incomplete_as == "partial" else "empty_tar_no_models"
+                        )
+                        continue
+                run_encode_shard_multigpu(
+                    os.path.abspath(config_path),
+                    shard_render,
+                    encode_gpus,
+                    prior_encode_passes=int(ent.get("encode_passes", 0)),
+                    encode_retry_policy=encode_retry_policy,
+                )
+                ent["encode_passes"] = int(ent.get("encode_passes", 0)) + 1
+                classify = _classify_all(render_dir, stages, cfg, state)
                 st = classify.get(stem)
                 if st == "encode_done":
                     ent["render_encode"] = "done"
                     ent["last_error"] = None
+                    ent["encode_passes"] = 0
+                elif incomplete_as == "partial":
+                    ent["render_encode"] = "partial"
+                    ent["last_error"] = None
+                    print(
+                        f"[WATCHDOG] {stem}: encode still incomplete after pass — "
+                        f"treating as partial (disk outputs kept; no re-download). "
+                        f"status={st!r}",
+                        flush=True,
+                    )
                 else:
                     ent["render_encode"] = "error"
                     ent["last_error"] = "encode_incomplete_after_pass"
@@ -361,16 +611,20 @@ def main() -> None:
             time.sleep(interval)
             continue
 
-        run_download_phase(cfg)
+        wd_opts = cfg.get("pipeline", {}).get("watchdog", {}) or {}
+        if wd_opts.get("prefetch_downloads", False):
+            run_download_phase(cfg)
 
         hf_up = (cfg.get("hf") or {}).get("upload") or {}
         remote: set[str] | None = None
+        hf_tok = hf_hub_token(cfg)
         if hf_up.get("enabled", False):
             try:
                 remote = _remote_tar_set(
                     hf_up["repo_id"],
                     hf_up.get("repo_type", "dataset"),
                     hf_up.get("path_in_repo", "github/render"),
+                    token=hf_tok,
                 )
                 print(f"[WATCHDOG] Hub has {len(remote)} shard archive(s) under {hf_up.get('path_in_repo')}", flush=True)
             except Exception as e:
@@ -378,7 +632,7 @@ def main() -> None:
                 remote = set()
 
         try:
-            one_cycle(config_path, cfg, state, remote)
+            one_cycle(config_path, cfg, state, remote, hf_token=hf_tok)
         except Exception as e:
             print(f"[WATCHDOG] cycle error: {e}", flush=True)
             import traceback
@@ -387,7 +641,9 @@ def main() -> None:
 
         save_state(state_path, state)
 
-        done_dl = sum(1 for s in state["shards"].values() if s.get("download") == "done")
+        done_dl = sum(
+            1 for s in state["shards"].values() if s.get("download") in ("done", "not_required")
+        )
         done_re = sum(1 for s in state["shards"].values() if s.get("render_encode") == "done")
         done_up = sum(1 for s in state["shards"].values() if s.get("upload") in ("done", "skipped"))
         print(

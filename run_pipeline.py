@@ -123,43 +123,102 @@ def _render_thread(
 
 # ── Shard state scanner ─────────────────────────────────────────────
 
-def _classify_shards(render_dir: str, stages: list[str], cfg: dict | None = None) -> dict[str, str]:
-    """Classify each shard sub-directory as 'encode_done', 'render_done', or 'partial'."""
+def object_encode_complete(scene_dir: str, stages: list[str], cfg: dict | None = None) -> bool:
+    """True when all enabled encode stages have outputs on disk (same rules as encode_object skips).
+
+    If save_dino_features is false, dino_features.npz may be absent once unilat+slat+ss exist.
+    """
     from encoders import STAGE_DONE_FILES
 
     save_dino = True
     if cfg is not None:
         save_dino = bool(cfg.get("stages", {}).get("save_dino_features", False))
-
-    def _object_encoded(scene_dir: str) -> bool:
-        """True when all enabled encode stages have their outputs on disk.
-
-        If save_dino_features is false, encode_object removes dino_features.npz after
-        unilat+slat+ss complete; treat dino as satisfied when those three exist.
-        """
-        lat = os.path.join(scene_dir, "latents")
-        for s in stages:
-            if s not in STAGE_DONE_FILES:
+    lat = os.path.join(scene_dir, "latents")
+    for s in stages:
+        if s not in STAGE_DONE_FILES:
+            continue
+        name = STAGE_DONE_FILES[s]
+        p = os.path.join(lat, name)
+        if s == "dino_features" and not save_dino:
+            if os.path.isfile(p):
                 continue
-            name = STAGE_DONE_FILES[s]
-            p = os.path.join(lat, name)
-            if s == "dino_features" and not save_dino:
-                if os.path.isfile(p):
-                    continue
-                # Matches encode_object: dino npz is removed once unilat+slat+ss exist.
-                if all(
-                    os.path.isfile(os.path.join(lat, STAGE_DONE_FILES[x]))
-                    for x in ("unilat", "slat", "ss")
-                ):
-                    continue
-                return False
-            if not os.path.isfile(p):
-                return False
-        return True
+            if all(
+                os.path.isfile(os.path.join(lat, STAGE_DONE_FILES[x]))
+                for x in ("unilat", "slat", "ss")
+            ):
+                continue
+            return False
+        if not os.path.isfile(p):
+            return False
+    return True
 
-    status = {}
+
+def object_has_encode_progress(scene_dir: str, stages: list[str], cfg: dict | None = None) -> bool:
+    """True if any enabled stage latent artifact exists (encode was started / partial success)."""
+    from encoders import STAGE_DONE_FILES
+
+    lat = os.path.join(scene_dir, "latents")
+    if not os.path.isdir(lat):
+        return False
+    for s in stages:
+        if s not in STAGE_DONE_FILES:
+            continue
+        if os.path.isfile(os.path.join(lat, STAGE_DONE_FILES[s])):
+            return True
+    return False
+
+
+def object_needs_encode(
+    scene_dir: str,
+    stages: list[str],
+    cfg: dict | None,
+    *,
+    prior_shard_encode_passes: int,
+    retry_policy: str,
+) -> bool:
+    """Whether this object should still be queued for encode (per watchdog policy).
+
+    * ``any_incomplete``: any missing stage output → keep retrying (legacy).
+    * ``never_started_only``: after at least one full shard encode pass
+      (``prior_shard_encode_passes >= 1``), only retry objects that still have
+      **no** latent files — i.e. never got a real encode product. Objects with
+      partial ``latents/*.npz`` are treated as "tried" and not re-queued.
+    """
+    if not os.path.isfile(os.path.join(scene_dir, "mesh.ply")):
+        return False
+    if object_encode_complete(scene_dir, stages, cfg):
+        return False
+    if retry_policy != "never_started_only":
+        return True
+    if prior_shard_encode_passes < 1:
+        return True
+    return not object_has_encode_progress(scene_dir, stages, cfg)
+
+
+def _classify_shards(
+    render_dir: str,
+    stages: list[str],
+    cfg: dict | None = None,
+    shard_encode_passes: dict[str, int] | None = None,
+) -> dict[str, str]:
+    """Classify each **shard** directory (one tar → one folder under render_dir).
+
+    Status is **per shard**, but it is computed from **every object subfolder** inside
+    that shard: ``encode_done`` means each object has finished all encode stages
+    (strict), or under watchdog relaxed policy that nothing left to retry
+    (``shard_encode_passes`` + ``encode_retry_objects``). ``render_done`` means
+    every object has ``mesh.ply`` but encode is not fully done / still needs work.
+    ``partial`` means at least one object is missing ``mesh.ply``.
+    """
+    status: dict[str, str] = {}
     if not os.path.isdir(render_dir):
         return status
+
+    wd = (cfg.get("pipeline") or {}).get("watchdog") or {} if cfg else {}
+    retry_policy = (wd.get("encode_retry_objects") or "any_incomplete").strip().lower()
+    if retry_policy not in ("any_incomplete", "never_started_only"):
+        retry_policy = "any_incomplete"
+    relaxed = shard_encode_passes is not None
 
     for shard_name in sorted(os.listdir(render_dir)):
         shard_path = os.path.join(render_dir, shard_name)
@@ -177,12 +236,43 @@ def _classify_shards(render_dir: str, stages: list[str], cfg: dict | None = None
             os.path.isfile(os.path.join(shard_path, d, "mesh.ply"))
             for d in objects
         )
-        all_encoded = all_rendered and all(
-            _object_encoded(os.path.join(shard_path, d))
+        passes = int((shard_encode_passes or {}).get(shard_name, 0)) if shard_encode_passes else 0
+
+        if not relaxed:
+            all_encoded = all_rendered and all(
+                object_encode_complete(os.path.join(shard_path, d), stages, cfg)
+                for d in objects
+            )
+            if all_encoded:
+                status[shard_name] = "encode_done"
+            elif all_rendered:
+                status[shard_name] = "render_done"
+            else:
+                status[shard_name] = "partial"
+            continue
+
+        all_encoded_strict = all_rendered and all(
+            object_encode_complete(os.path.join(shard_path, d), stages, cfg)
             for d in objects
         )
+        if all_encoded_strict:
+            status[shard_name] = "encode_done"
+            continue
 
-        if all_encoded:
+        any_needs = False
+        for d in objects:
+            scene_dir = os.path.join(shard_path, d)
+            if object_needs_encode(
+                scene_dir,
+                stages,
+                cfg,
+                prior_shard_encode_passes=passes,
+                retry_policy=retry_policy,
+            ):
+                any_needs = True
+                break
+
+        if all_rendered and not any_needs:
             status[shard_name] = "encode_done"
         elif all_rendered:
             status[shard_name] = "render_done"
@@ -275,11 +365,17 @@ def main():
             for obj_name in sorted(os.listdir(shard_path)):
                 obj_dir = os.path.join(shard_path, obj_name)
                 if os.path.isdir(obj_dir) and os.path.isfile(os.path.join(obj_dir, "mesh.ply")):
+                    if object_encode_complete(obj_dir, stages, cfg):
+                        continue
                     encode_queue.put(obj_dir)
                     obj_count += 1
 
         encode_queue.put(_SENTINEL)
         print(f"[PIPELINE] Queued {obj_count} objects for encoding on GPUs {encode_gpus}", flush=True)
+
+        if obj_count == 0:
+            print("[PIPELINE] Nothing pending (all objects already encoded).", flush=True)
+            return
 
         workers = []
         for gid in encode_gpus:

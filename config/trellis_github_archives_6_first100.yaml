@@ -12,7 +12,8 @@
 #   <data_root>/shards/github/*.tar.zst
 #
 # Upload: python upload_hf_encoded_shards.py --config <this file> --all-verified
-#   Needs HUGGINGFACE_HUB_TOKEN and hf.upload.enabled: true (or --force).
+#   Auth: HUGGINGFACE_HUB_TOKEN / HF_TOKEN, or hf.upload.token in trellis_github_archives_6_first100.local.yaml (gitignored).
+#   hf.upload.enabled: true (or pass --force).
 
 # ─── Paths (explicit: encoders/config.py defaults assume archives-5 under data_root) ───
 paths:
@@ -41,6 +42,8 @@ hf:
 
   upload:
     enabled: false
+    # Optional: set token in sibling file trellis_github_archives_6_first100.local.yaml (not committed).
+    # token: hf_...
     # Processed outputs (packed shards); naming aligned with trellis500k-github-archives-6
     repo_id: Dennis0626/trellis500k-github-archives-6-processed
     repo_type: dataset
@@ -81,8 +84,9 @@ stages:
   save_dino_features: false
 
 gpus:
-  render: auto
-  encode: auto
+  # Same device list for render and encode: full pool for Blender, then the same pool for encode workers (sequential).
+  # For interleaved render+encode on one machine, use pool instead of splitting render/encode.
+  pool: auto
 
 render:
   num_views: 40
@@ -104,6 +108,14 @@ pipeline:
   delete_source_shard_tar: true
   watchdog:
     interval_seconds: 600
+    prefetch_downloads: false   # one shard .tar.zst at a time when that stem runs; true = bulk prefetch each cycle
+    incomplete_encode_as: partial  # partial | error — tolerate incomplete shards without forcing redo
+    # encode_retry_objects: any_incomplete | never_started_only
+    #   any_incomplete (default): keep re-encoding every object missing outputs.
+    #   never_started_only: after encode_passes>=1 for this shard, only retry objects with NO latents/*.npz yet
+    #   (partial failures = "ran once" → stop re-queuing). Upload / refresh_upload_record stay strict (all stages done).
+    encode_retry_objects: any_incomplete
+    max_encode_passes: -1        # -1 = keep trying encode; 0 = never run encode (unusual); N = cap attempts per shard
     download_workers: 4
     download_retries: 5
     shards_only_download: true

@@ -76,8 +76,8 @@ stages:
 # In pipeline mode, render and encode GPUs should ideally not overlap.
 # "auto" = use all detected GPUs.  Or specify list: [0, 1, 2, 3]
 gpus:
-  render: auto
-  encode: auto
+  # pool: auto → render and encode both use all detected GPUs (sequential in pipeline_watchdog).
+  pool: auto
 
 # Render settings
 render:
@@ -103,6 +103,13 @@ pipeline:
   # pipeline_watchdog.py: loop + state file (default <data_root>/github/pipeline_state.json)
   watchdog:
     interval_seconds: 600
+    # false (default): fetch each shard .tar.zst only when that stem is processed (one file, sequential).
+    # true: at each cycle start download the whole shard_index range in parallel (uses download_workers).
+    prefetch_downloads: false
+    # After an encode pass, shard still not fully encode_done: "partial" = soft (no stigma), "error" = hard.
+    incomplete_encode_as: partial
+    # -1 = retry encode each cycle until done; N>=0 = stop after N encode subprocess runs per shard (keep disk as-is).
+    max_encode_passes: -1
     download_workers: 4
     download_retries: 5
     shards_only_download: true   # true = only .tar.zst (matches run_pipeline); false + manifest_only_download true = manifest only

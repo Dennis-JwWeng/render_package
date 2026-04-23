@@ -7,7 +7,7 @@ Flow: optional local tar.zst integrity read → upload → verify remote size ma
       sizes and optionally delete the duplicate local pack (delete_local_when_remote_exists).
 
 Reads hf.upload (+ paths.pack_staging_dir) from the same YAML as the render/encode pipeline.
-Auth: export HUGGINGFACE_HUB_TOKEN=...
+Auth: HUGGINGFACE_HUB_TOKEN / HF_TOKEN, or hf.upload.token (e.g. in <config>.local.yaml merged by load_config).
 
 Usage:
   # Dry-run: show what would be packed/uploaded
@@ -151,7 +151,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    from encoders.config import load_config
+    from encoders.config import hf_hub_token, load_config
 
     cfg = load_config(args.config)
     up = (cfg.get("hf") or {}).get("upload") or {}
@@ -203,7 +203,8 @@ def main() -> None:
 
     status_all = _classify_shards(render_dir, stages, cfg)
 
-    api = HfApi()
+    hf_tok = hf_hub_token(cfg)
+    api = HfApi(token=hf_tok)
     remote_set: set[str] | None = None
     if will_upload and not args.no_skip_remote:
         print(f"[HF] Listing remote files in {repo_id} ({repo_type}) ...", flush=True)

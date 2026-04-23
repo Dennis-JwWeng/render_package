@@ -53,7 +53,8 @@ def voxelize_mesh(mesh_path: str, grid_size: int = 64):
     Runs open3d in a subprocess to survive segfaults on corrupt meshes."""
     import subprocess
 
-    tmp_fd, tmp_path = tempfile.mkstemp(suffix=".npz")
+    mesh_dir = os.path.dirname(os.path.abspath(mesh_path))
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix=".npz", dir=mesh_dir)
     os.close(tmp_fd)
     try:
         code = (

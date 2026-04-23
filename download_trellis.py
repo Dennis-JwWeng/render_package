@@ -221,6 +221,34 @@ def run_download_tasks(
     }
 
 
+def find_shard_download_task(repo: str, stem: str) -> dict | None:
+    """Return one task {path, size} for shards/.../<stem>.tar.zst, or None if not listed."""
+    for f in api_list(repo, "shards"):
+        p = f.get("path") or ""
+        if not p.endswith(".tar.zst"):
+            continue
+        if os.path.basename(p).replace(".tar.zst", "") == stem:
+            return f
+    return None
+
+
+def download_shard_tar(
+    repo: str,
+    dest: str,
+    stem: str,
+    *,
+    retries: int = 5,
+    quiet: bool = False,
+) -> bool:
+    """Download a single shard tarball (sequential: one task, one worker). Returns True if on disk and non-empty or skipped as complete."""
+    task = find_shard_download_task(repo, stem)
+    if task is None:
+        print(f"[DOWNLOAD] No remote shard listed for stem {stem}", flush=True)
+        return False
+    stats = run_download_tasks(repo, dest, [task], workers=1, retries=retries, quiet=quiet)
+    return stats["fail"] == 0
+
+
 def main():
     global MIRROR
     parser = argparse.ArgumentParser(
