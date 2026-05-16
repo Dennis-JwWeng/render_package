@@ -428,6 +428,13 @@ def one_cycle(
     stages = [s for s in ALL_STAGES if cfg.get("stages", {}).get(s, True)]
 
     stems = expected_stems(cfg)
+    if not stems and state.get("shards"):
+        stems = sorted(state["shards"].keys())
+        print(
+            f"[WATCHDOG] expected_stems empty (HF mirror/API list failed); "
+            f"falling back to {len(stems)} id(s) from pipeline_state.json",
+            flush=True,
+        )
     classify = _classify_all(render_dir, stages, cfg, state)
 
     render_gpus = cfg["gpus"]["render"]

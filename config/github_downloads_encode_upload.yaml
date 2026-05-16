@@ -1,0 +1,95 @@
+# 本机数据根：~/Downloads/data（与 data/github/pipeline_state.json 对齐）
+# 流程：pipeline_watchdog.py --encode-only → 编码 → 打包 → HF 上传（需 HF_TOKEN 或 .local.yaml）
+#
+#   source envs/env/bin/activate && export SPCONV_ALGO=native
+#   export HF_TOKEN=hf_...   # 或 config/github_downloads_encode_upload.local.yaml
+#   python pipeline_watchdog.py --config config/github_downloads_encode_upload.yaml --encode-only
+
+paths:
+  data_root: /home/saining/Downloads/data
+  shard_dir: /home/saining/Downloads/data/shards/github
+  render_dir: /home/saining/Downloads/data/github/render
+  raw_dir: /home/saining/Downloads/data/github/raw
+  render_tmp: /home/saining/Downloads/data/github/.render_tmp
+  pack_staging_dir: /home/saining/Downloads/data/github/pack_for_upload
+  blender_bin: auto
+
+hf:
+  download:
+    repo_id: DennisWeng06/trellis500k-github-archives-6
+    repo_pattern: datasets/DennisWeng06/trellis500k-github-archives-{}
+    suffix: 6
+    shard_index_start: 0
+    shard_index_end: 99
+    mirror: https://hf-mirror.com
+    dest: /home/saining/Downloads/data
+  upload:
+    enabled: true
+    repo_id: Dennis0626/trellis500k-github-archives-6-processed
+    repo_type: dataset
+    revision: main
+    path_in_repo: github/render
+    archive:
+      format: tar_zst
+      zstd_level: 10
+      include:
+        - latents
+        - transforms.json
+        - mesh.ply
+      exclude_globs:
+        - "images/**/*.png"
+    verify_local_archive_before_upload: true
+    verify_remote_after_upload: true
+    delete_local_archive_after_success: true
+    delete_local_when_remote_exists: true
+
+weights:
+  unilat_encoder: weights/unilat/encoder
+  slat_encoder: weights/trellis/slat_enc
+  ss_encoder: weights/trellis/ss_enc
+  dinov2: weights/dinov2/dinov2_vitl14_reg4_pretrain.pth
+  dinov2_repo: third_party/dinov2
+
+third_party:
+  trellis: third_party/trellis
+  unilat3d: third_party/unilat3d
+
+stages:
+  render: true
+  dino_features: true
+  unilat: true
+  slat: true
+  ss: true
+  save_dino_features: false
+
+gpus:
+  # 仅使用 2 张卡做 encode（encode-only 下只用 encode 列表；与 render 设成同一对即可）
+  render: [0, 1]
+  encode: [0, 1]
+
+render:
+  num_views: 40
+  resolution: 512
+  num_workers: 4
+
+encode:
+  device: cuda:0
+  batch_size: 8
+  max_voxels: 32768
+  subsample_seed: 0
+  max_views: -1
+
+pipeline:
+  num_shards: 100
+  sleep_minutes: 30
+  no_delete_shard: true
+  delete_source_shard_tar: true
+  watchdog:
+    interval_seconds: 600
+    prefetch_downloads: false
+    incomplete_encode_as: partial
+    max_encode_passes: -1
+    download_workers: 4
+    download_retries: 5
+    shards_only_download: true
+    manifest_only_download: false

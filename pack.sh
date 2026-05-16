@@ -129,6 +129,8 @@ check_file "run_pipeline.py"
 check_file "verify_install.py"
 check_file "setup.sh"
 check_file "config/default.yaml"
+check_file "config/github_downloads_encode_upload.yaml"
+check_file "config/github_downloads_encode_upload.local.yaml.example"
 
 # Envs
 check_file "environment.yml"

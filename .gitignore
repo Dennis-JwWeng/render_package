@@ -31,6 +31,8 @@ build/
 
 # Local data paths (if symlinked or copied here)
 .github_cache/
+# Symlink to e.g. ~/Downloads/data (github render + shards)
+data/
 
 # Local YAML overrides (secrets: hf.upload.token)
 *.local.yaml

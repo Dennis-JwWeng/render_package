@@ -1,0 +1,5 @@
+# 复制为 github_downloads_encode_upload.local.yaml（已在 .gitignore）
+# 勿把真实 token 写进本 example 文件以免误入 git
+hf:
+  upload:
+    token: hf_REPLACE_ME

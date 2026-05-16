@@ -1,0 +1,108 @@
+# ─── Trellis500K GitHub archives-6: shard indices 100–199 (HF listing order) ───
+#
+# All paths are under: /home/saining/Downloads/workspace/data
+#   (resolves to ~/Downloads/data/ via the workspace/data symlink — same files.)
+#
+# Directory layout (no need to “fully migrate” into one subfolder: point each role explicitly):
+#   <data_root>/trellis500k-github-archives-6/   HF download + shards/github/*.tar.zst, manifest, …
+#   <data_root>/github/                        render, raw, tmp, pack (pipeline state: <data_root>/github/…)
+#
+# Download range: global indices [100, 199] inclusive → 100 tar shards
+#   (indices follow download_trellis.expected_shard_stems: sorted *.tar.zst on Hub)
+#
+# Upload: python upload_hf_encoded_shards.py --config <this file> --all-verified
+#   Auth: HUGGINGFACE_HUB_TOKEN / HF_TOKEN, or hf.upload.token in
+#   trellis_github_archives_6_shards_100_199.local.yaml (gitignored).
+
+paths:
+  # Logical data root: pipeline state / upload sidecars use <data_root>/github/…
+  data_root: /home/saining/Downloads/workspace/data
+  shard_dir: /home/saining/Downloads/workspace/data/trellis500k-github-archives-6/shards/github
+  render_dir: /home/saining/Downloads/workspace/data/github/render
+  raw_dir: /home/saining/Downloads/workspace/data/github/raw
+  render_tmp: /home/saining/Downloads/workspace/data/github/.render_tmp
+  blender_bin: auto
+
+  pack_staging_dir: /home/saining/Downloads/workspace/data/github/pack_for_upload
+
+hf:
+  download:
+    repo_id: DennisWeng06/trellis500k-github-archives-6
+    repo_pattern: datasets/DennisWeng06/trellis500k-github-archives-{}
+    suffix: 6
+    shard_index_start: 100
+    shard_index_end: 199
+    mirror: https://hf-mirror.com
+    dest: /home/saining/Downloads/workspace/data/trellis500k-github-archives-6
+
+  upload:
+    enabled: false
+    repo_id: Dennis0626/trellis500k-github-archives-6-processed
+    repo_type: dataset
+    revision: main
+    path_in_repo: github/render
+    archive:
+      format: tar_zst
+      zstd_level: 10
+      include:
+        - latents
+        - transforms.json
+        - mesh.ply
+      exclude_globs:
+        - "images/**/*.png"
+    verify_local_archive_before_upload: true
+    verify_remote_after_upload: true
+    delete_local_archive_after_success: true
+    delete_local_when_remote_exists: true
+
+weights:
+  unilat_encoder: weights/unilat/encoder
+  slat_encoder: weights/trellis/slat_enc
+  ss_encoder: weights/trellis/ss_enc
+  dinov2: weights/dinov2/dinov2_vitl14_reg4_pretrain.pth
+  dinov2_repo: third_party/dinov2
+
+third_party:
+  trellis: third_party/trellis
+  unilat3d: third_party/unilat3d
+
+stages:
+  render: true
+  dino_features: true
+  unilat: true
+  slat: true
+  ss: true
+  save_dino_features: false
+
+gpus:
+  # pipeline_watchdog / render_github 用 gpus.render；与 encode 复合同一列表
+  pool: [0, 1]
+
+render:
+  num_views: 40
+  resolution: 512
+  num_workers: 4
+
+encode:
+  device: cuda:0
+  batch_size: 8
+  max_voxels: 32768
+  subsample_seed: 0
+  max_views: -1
+
+pipeline:
+  num_shards: 100
+  sleep_minutes: 30
+  no_delete_shard: true
+  delete_source_shard_tar: true
+  watchdog:
+    interval_seconds: 600
+    prefetch_downloads: false
+    incomplete_encode_as: partial
+    encode_retry_objects: any_incomplete
+    max_encode_passes: -1
+    download_workers: 4
+    download_retries: 5
+    shards_only_download: true
+    manifest_only_download: false
+    delete_source_shard_tar_after_render: false

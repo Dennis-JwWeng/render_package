@@ -19,6 +19,9 @@ Usage:
   # Named shards only
   python upload_hf_encoded_shards.py --config config/default.yaml --shards shard_2253590,shard_2253592
 
+  # All shard_* under render_dir (e.g. render-only), pack+upload — use config/github_render_pack_upload.yaml
+  python upload_hf_encoded_shards.py --config config/github_render_pack_upload.yaml --all-shard-dirs --include-unencoded --force
+
   # Pack locally only (no HF)
   python upload_hf_encoded_shards.py --config config/default.yaml --all-verified --pack-only
 """
@@ -139,6 +142,16 @@ def main() -> None:
     parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--shards", type=str, default=None, help="Comma-separated shard dir names under render_dir")
     parser.add_argument("--all-verified", action="store_true", help="Every encode_done shard under render_dir")
+    parser.add_argument(
+        "--all-shard-dirs",
+        action="store_true",
+        help="Every top-level shard_* directory under render_dir (pair with --include-unencoded if not yet encode_done)",
+    )
+    parser.add_argument(
+        "--include-unencoded",
+        action="store_true",
+        help="Do not require encode_done before pack/upload (e.g. render output with images/mesh, no latents yet)",
+    )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--pack-only", action="store_true")
     parser.add_argument("--upload-only", action="store_true", help="Assume .tar.zst already in pack_staging_dir")
@@ -197,8 +210,20 @@ def main() -> None:
         if not names:
             print("[WARN] No encode_done shards found.", flush=True)
             return
+    elif args.all_shard_dirs:
+        if not os.path.isdir(render_dir):
+            print(f"[ERROR] render_dir is not a directory: {render_dir}", flush=True)
+            sys.exit(1)
+        names = sorted(
+            n
+            for n in os.listdir(render_dir)
+            if n.startswith("shard_") and os.path.isdir(os.path.join(render_dir, n))
+        )
+        if not names:
+            print("[WARN] No shard_* directories under render_dir.", flush=True)
+            return
     else:
-        print("[ERROR] Pass --shards or --all-verified.", flush=True)
+        print("[ERROR] Pass --shards, --all-verified, or --all-shard-dirs.", flush=True)
         sys.exit(1)
 
     status_all = _classify_shards(render_dir, stages, cfg)
@@ -215,7 +240,7 @@ def main() -> None:
         if not os.path.isdir(shard_path):
             print(f"[SKIP] missing {shard_path}", flush=True)
             continue
-        if status_all.get(name) != "encode_done":
+        if not args.include_unencoded and status_all.get(name) != "encode_done":
             print(f"[SKIP] {name} not encode_done (status={status_all.get(name, 'missing')})", flush=True)
             continue
 

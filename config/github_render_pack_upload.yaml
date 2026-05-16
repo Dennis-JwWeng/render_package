@@ -1,0 +1,92 @@
+# Pack render trees under a flat `data/github/render` layout and (optionally) upload .tar.zst
+# to Hugging Face, without first copying to trellis500k-github-archives-6.
+#
+# All paths live under one data root (same volume) to avoid cross-disk copies.
+# Typical:
+#   export HUGGINGFACE_HUB_TOKEN=hf_...
+#   python upload_hf_encoded_shards.py --config config/github_render_pack_upload.yaml \
+#     --all-shard-dirs --include-unencoded --force --pack-only
+#   # or add upload after a dry run:
+#   python upload_hf_encoded_shards.py --config config/github_render_pack_upload.yaml \
+#     --all-shard-dirs --include-unencoded --force
+#
+# Optional secrets: config/github_render_pack_upload.local.yaml (gitignored) with hf.upload.token
+
+paths:
+  data_root: /home/saining/Downloads/data
+  shard_dir: /home/saining/Downloads/data/trellis500k-github-archives-6/shards/github
+  render_dir: /home/saining/Downloads/data/github/render
+  raw_dir: /home/saining/Downloads/data/github/raw
+  render_tmp: /home/saining/Downloads/data/github/.render_tmp
+  pack_staging_dir: /home/saining/Downloads/data/github/pack_for_upload
+  blender_bin: auto
+
+hf:
+  download:
+    repo_id: DennisWeng06/trellis500k-github-archives-6
+    repo_pattern: datasets/DennisWeng06/trellis500k-github-archives-{}
+    suffix: 6
+    shard_index_start: 0
+    shard_index_end: 0
+    mirror: https://hf-mirror.com
+    dest: /home/saining/Downloads/data/trellis500k-github-archives-6
+  upload:
+    enabled: false
+    repo_id: Dennis0626/trellis500k-github-archives-6-processed
+    repo_type: dataset
+    revision: main
+    # Separate from encoded shard packs: raw render exports
+    path_in_repo: exports/github_render
+    archive:
+      format: tar_zst
+      zstd_level: 6
+      include:
+        - images
+        - mesh.ply
+        - transforms.json
+        - latents
+      exclude_globs: []
+    verify_local_archive_before_upload: true
+    verify_remote_after_upload: true
+    delete_local_archive_after_success: true
+    delete_local_when_remote_exists: true
+
+weights:
+  unilat_encoder: weights/unilat/encoder
+  slat_encoder: weights/trellis/slat_enc
+  ss_encoder: weights/trellis/ss_enc
+  dinov2: weights/dinov2/dinov2_vitl14_reg4_pretrain.pth
+  dinov2_repo: third_party/dinov2
+
+third_party:
+  trellis: third_party/trellis
+  unilat3d: third_party/unilat3d
+
+stages:
+  render: true
+  dino_features: true
+  unilat: true
+  slat: true
+  ss: true
+  save_dino_features: false
+
+gpus:
+  pool: auto
+
+render:
+  num_views: 40
+  resolution: 512
+  num_workers: 4
+
+encode:
+  device: cuda:0
+  batch_size: 8
+  max_voxels: 32768
+  subsample_seed: 0
+  max_views: -1
+
+pipeline:
+  num_shards: 1
+  delete_source_shard_tar: false
+  no_delete_shard: true
+  sleep_minutes: 30
