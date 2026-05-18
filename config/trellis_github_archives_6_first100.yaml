@@ -114,6 +114,9 @@ pipeline:
   delete_source_shard_tar: true
   watchdog:
     interval_seconds: 600
+    # Full watchdog mode: once one shard finishes render, queue it for encode/upload
+    # and immediately move Blender to the next shard.
+    overlap_render_encode: true
     prefetch_downloads: false   # one shard .tar.zst at a time when that stem runs; true = bulk prefetch each cycle
     incomplete_encode_as: partial  # partial | error — tolerate incomplete shards without forcing redo
     # encode_retry_objects: any_incomplete | never_started_only

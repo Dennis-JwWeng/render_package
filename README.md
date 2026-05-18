@@ -322,6 +322,13 @@ For each shard in that range, the full watchdog does:
 download shard tar.zst -> render mesh/images/transforms -> encode latents -> pack encoded archive -> upload -> cleanup
 ```
 
+With `pipeline.watchdog.overlap_render_encode: true`, full watchdog mode runs
+that flow as a shard pipeline: when shard A finishes Blender rendering, shard A
+is queued for encode/upload and Blender immediately moves on to shard B. This
+keeps render moving instead of waiting for shard A's encode pass to finish.
+Use non-overlapping `gpus.render` and `gpus.encode` lists for best stability;
+the watchdog prints a warning if they overlap.
+
 The uploaded archive is shard-scoped. Small shards keep the legacy
 `github/render/<shard_id>.tar.zst` name; large shards can be split on object
 boundaries into `github/render/<shard_id>.part_00000.tar.zst`,

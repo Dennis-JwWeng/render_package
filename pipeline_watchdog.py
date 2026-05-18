@@ -37,10 +37,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import queue
 import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from typing import Any
@@ -406,6 +408,248 @@ def _try_upload_shard_after_encode_done(
         ent["upload"] = "error"
         ent["last_error"] = str(e)
         print(f"[WATCHDOG] upload ERROR {stem}: {e}", flush=True)
+
+
+def _encode_upload_one_shard(
+    config_path: str,
+    cfg: dict,
+    state: dict[str, Any],
+    stem: str,
+    encode_gpus: list[int],
+    stages: list[str],
+    remote_shards: set[str] | None,
+    hf_token: str | None,
+    max_encode_passes: int,
+    encode_retry_policy: str,
+    incomplete_as: str,
+) -> None:
+    render_dir = cfg["paths"]["render_dir"]
+    shard_render = os.path.join(render_dir, stem)
+    ent = state["shards"].setdefault(stem, _shard_entry())
+    passes = int(ent.get("encode_passes", 0))
+    if max_encode_passes >= 0 and passes >= max_encode_passes:
+        print(
+            f"[WATCHDOG] {stem}: skip encode (encode_passes={passes} >= max_encode_passes={max_encode_passes}); "
+            f"keeping existing outputs on disk",
+            flush=True,
+        )
+        ent["render_encode"] = "partial"
+        ent["last_error"] = None if incomplete_as == "partial" else "max_encode_passes_reached"
+        return
+
+    try:
+        if not os.path.isdir(shard_render):
+            raise FileNotFoundError(f"render_done but render dir missing: {shard_render}")
+        print(f"[WATCHDOG] {stem}: encode/upload worker start", flush=True)
+        run_encode_shard_multigpu(
+            os.path.abspath(config_path),
+            shard_render,
+            encode_gpus,
+            prior_encode_passes=int(ent.get("encode_passes", 0)),
+            encode_retry_policy=encode_retry_policy,
+        )
+        ent["encode_passes"] = int(ent.get("encode_passes", 0)) + 1
+        classify = _classify_all(render_dir, stages, cfg, state)
+        st = classify.get(stem)
+        if st == "encode_done":
+            ent["render_encode"] = "done"
+            ent["last_error"] = None
+            ent["encode_passes"] = 0
+            _try_upload_shard_after_encode_done(
+                config_path, cfg, stem, ent, remote_shards, hf_token
+            )
+        elif incomplete_as == "partial":
+            ent["render_encode"] = "partial"
+            ent["last_error"] = None
+            print(
+                f"[WATCHDOG] {stem}: encode still incomplete after pass — "
+                f"treating as partial (disk outputs kept; no re-download). "
+                f"status={st!r}",
+                flush=True,
+            )
+        else:
+            ent["render_encode"] = "error"
+            ent["last_error"] = "encode_incomplete_after_pass"
+    except Exception as e:
+        ent["render_encode"] = "error"
+        ent["last_error"] = str(e)
+        print(f"[WATCHDOG] ERROR {stem}: {e}", flush=True)
+
+
+def _has_mesh_outputs(shard_render: str) -> bool:
+    if not os.path.isdir(shard_render):
+        return False
+    return any(
+        os.path.isdir(os.path.join(shard_render, d))
+        and os.path.isfile(os.path.join(shard_render, d, "mesh.ply"))
+        for d in os.listdir(shard_render)
+    )
+
+
+def one_cycle_full_overlap(
+    config_path: str,
+    cfg: dict,
+    state: dict[str, Any],
+    remote_shards: set[str] | None,
+    hf_token: str | None,
+) -> None:
+    paths = cfg["paths"]
+    shard_dir = paths["shard_dir"]
+    render_dir = paths["render_dir"]
+    raw_dir = paths["raw_dir"]
+    render_tmp = paths.get("render_tmp")
+
+    from encoders import ALL_STAGES
+    import render_github as rg
+
+    stages = [s for s in ALL_STAGES if cfg.get("stages", {}).get(s, True)]
+    stems = expected_stems(cfg)
+    if not stems and state.get("shards"):
+        stems = sorted(state["shards"].keys())
+        print(
+            f"[WATCHDOG] expected_stems empty (HF mirror/API list failed); "
+            f"falling back to {len(stems)} id(s) from pipeline_state.json",
+            flush=True,
+        )
+    classify = _classify_all(render_dir, stages, cfg, state)
+
+    render_gpus = cfg["gpus"]["render"]
+    encode_gpus = cfg["gpus"]["encode"]
+    if set(render_gpus) & set(encode_gpus):
+        print(
+            "[WATCHDOG] WARN: overlap_render_encode is enabled but render and encode GPU lists overlap; "
+            "this may increase memory pressure.",
+            flush=True,
+        )
+    num_workers = int(cfg.get("render", {}).get("num_workers", 4))
+    num_views = int(cfg.get("render", {}).get("num_views", 40))
+    no_delete_shard = bool(cfg.get("pipeline", {}).get("no_delete_shard", True))
+    wd = cfg.get("pipeline", {}).get("watchdog", {}) or {}
+    incomplete_as = (wd.get("incomplete_encode_as") or "error").strip().lower()
+    if incomplete_as not in ("error", "partial"):
+        incomplete_as = "error"
+    max_encode_passes = int(wd.get("max_encode_passes", -1))
+    encode_retry_policy = (wd.get("encode_retry_objects") or "any_incomplete").strip().lower()
+    if encode_retry_policy not in ("any_incomplete", "never_started_only"):
+        encode_retry_policy = "any_incomplete"
+
+    encode_queue: queue.Queue[str | None] = queue.Queue()
+
+    def _worker() -> None:
+        while True:
+            stem_or_none = encode_queue.get()
+            try:
+                if stem_or_none is None:
+                    return
+                _encode_upload_one_shard(
+                    config_path,
+                    cfg,
+                    state,
+                    stem_or_none,
+                    encode_gpus,
+                    stages,
+                    remote_shards,
+                    hf_token,
+                    max_encode_passes,
+                    encode_retry_policy,
+                    incomplete_as,
+                )
+            finally:
+                encode_queue.task_done()
+
+    worker = threading.Thread(target=_worker, name="watchdog-encode-upload", daemon=True)
+    worker.start()
+    queued: set[str] = set()
+
+    try:
+        for stem in stems:
+            if STOP:
+                break
+            zst = os.path.join(shard_dir, stem + ".tar.zst")
+            ent = state["shards"].setdefault(stem, _shard_entry())
+
+            if ent.get("skip_reason") == "empty_tar_no_models":
+                print(
+                    f"[WATCHDOG] {stem}: skip (tar produced no models last time; clear shard in pipeline_state to retry)",
+                    flush=True,
+                )
+                continue
+
+            st = classify.get(stem)
+            if st == "encode_done":
+                ent["encode_passes"] = 0
+                ent["last_error"] = None
+                ent.pop("skip_reason", None)
+                ent["render_encode"] = "done"
+                ent["download"] = "done" if os.path.isfile(zst) and os.path.getsize(zst) > 0 else "not_required"
+                print(f"[WATCHDOG] {stem}: encode_done — skip tar download and render", flush=True)
+                _try_upload_shard_after_encode_done(config_path, cfg, stem, ent, remote_shards, hf_token)
+                continue
+
+            needs_tar = st not in ("encode_done", "render_done")
+            if needs_tar:
+                if not (os.path.isfile(zst) and os.path.getsize(zst) > 0):
+                    print(f"[WATCHDOG] {stem}: download .tar.zst (needed for decompress/render)", flush=True)
+                    if not download_one_shard_tar(cfg, stem):
+                        ent["download"] = "pending"
+                        ent["last_error"] = "download_failed"
+                        continue
+                    if not (os.path.isfile(zst) and os.path.getsize(zst) > 0):
+                        ent["download"] = "pending"
+                        ent["last_error"] = "missing_local_tar_after_download"
+                        continue
+                ent["download"] = "done"
+            else:
+                ent["download"] = "done" if os.path.isfile(zst) and os.path.getsize(zst) > 0 else "not_required"
+                print(f"[WATCHDOG] {stem}: render_done — skip tar download; queue encode", flush=True)
+
+            if st != "render_done":
+                print(f"[WATCHDOG] {stem}: render (overlap mode; status was {st})", flush=True)
+                shard_render = os.path.join(render_dir, stem)
+                try:
+                    ent["render_encode"] = "in_progress"
+                    rg.render_shard_from_zst(
+                        zst_path=zst,
+                        render_dir=render_dir,
+                        raw_dir=raw_dir,
+                        gpu_ids=render_gpus,
+                        num_workers=num_workers,
+                        num_views=num_views,
+                        render_tmp=render_tmp,
+                        no_delete_shard=no_delete_shard,
+                    )
+                    if not os.path.isdir(shard_render):
+                        print(
+                            f"[WATCHDOG] {stem}: no render output (0 models or render failed); skip encode — "
+                            f"check tarball or clear skip_reason in state to retry",
+                            flush=True,
+                        )
+                        ent["skip_reason"] = "empty_tar_no_models"
+                        ent["render_encode"] = "partial"
+                        ent["last_error"] = None if incomplete_as == "partial" else "empty_tar_no_models"
+                        continue
+                    if not _has_mesh_outputs(shard_render):
+                        print(f"[WATCHDOG] {stem}: render dir has no mesh.ply; skip encode", flush=True)
+                        ent["skip_reason"] = "empty_tar_no_models"
+                        ent["render_encode"] = "partial"
+                        ent["last_error"] = None if incomplete_as == "partial" else "empty_tar_no_models"
+                        continue
+                except Exception as e:
+                    ent["render_encode"] = "error"
+                    ent["last_error"] = str(e)
+                    print(f"[WATCHDOG] ERROR {stem}: {e}", flush=True)
+                    continue
+
+            if stem not in queued:
+                ent["render_encode"] = "encode_queued"
+                ent["last_error"] = None
+                queued.add(stem)
+                encode_queue.put(stem)
+                print(f"[WATCHDOG] {stem}: queued encode/upload; continuing render pipeline", flush=True)
+    finally:
+        encode_queue.put(None)
+        encode_queue.join()
+        worker.join()
 
 
 def one_cycle(
@@ -851,7 +1095,10 @@ def main() -> None:
                 remote = set()
 
         try:
-            one_cycle(config_path, cfg, state, remote, hf_token=hf_tok, mode=watchdog_mode)
+            if watchdog_mode == "full" and bool(wd_opts.get("overlap_render_encode", False)):
+                one_cycle_full_overlap(config_path, cfg, state, remote, hf_token=hf_tok)
+            else:
+                one_cycle(config_path, cfg, state, remote, hf_token=hf_tok, mode=watchdog_mode)
         except Exception as e:
             print(f"[WATCHDOG] cycle error: {e}", flush=True)
             import traceback
