@@ -33,6 +33,10 @@ build/
 .github_cache/
 # Symlink to e.g. ~/Downloads/data (github render + shards)
 data/
+trellis500k-github-archives-*/
+
+# Local packaging artifacts
+*.tar.gz
 
 # Local YAML overrides (secrets: hf.upload.token)
 *.local.yaml
