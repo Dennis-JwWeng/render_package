@@ -23,19 +23,6 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _remote_stems_from_listing(paths_in_repo: list[str], path_prefix: str) -> set[str]:
-    """paths_in_repo: full paths from list_repo_files; prefix e.g. github/render."""
-    prefix = path_prefix.strip("/").replace("\\", "/") + "/"
-    out: set[str] = set()
-    for p in paths_in_repo:
-        p = p.replace("\\", "/")
-        if not p.startswith(prefix) or not p.endswith(".tar.zst"):
-            continue
-        base = os.path.basename(p)
-        out.add(base[: -len(".tar.zst")])
-    return out
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description="Write upload_record.json from config + Hub + disk")
     parser.add_argument("--config", type=str, required=True)
@@ -52,6 +39,7 @@ def main() -> None:
     from huggingface_hub import HfApi
     from pipeline_watchdog import expected_stems
     from run_pipeline import _classify_shards
+    from upload_hf_encoded_shards import _plan_archives, remote_completed_stems_from_listing
 
     cfg_path = os.path.abspath(os.path.expanduser(args.config))
     cfg = load_config(cfg_path)
@@ -72,6 +60,26 @@ def main() -> None:
     encode_done_all = sorted(k for k, v in classify.items() if v == "encode_done")
     encode_done_in_range = sorted(set(encode_done_all) & stems_expected)
 
+    arch = hf_up.get("archive") or {}
+    includes: list[str] = list(arch.get("include") or ["latents", "transforms.json", "mesh.ply"])
+    exclude_globs: list[str] = list(arch.get("exclude_globs") or [])
+    max_part_bytes = int(arch.get("max_part_bytes") or 0)
+    expected_archive_names: dict[str, list[str]] = {}
+    for stem in encode_done_in_range:
+        shard_path = os.path.join(render_dir, stem)
+        if not os.path.isdir(shard_path):
+            continue
+        expected_archive_names[stem] = [
+            archive_name
+            for archive_name, _ in _plan_archives(
+                stem,
+                shard_path,
+                includes,
+                exclude_globs,
+                max_part_bytes,
+            )
+        ]
+
     hub_listing_ok = False
     hub_error: str | None = None
     remote_stems: set[str] = set()
@@ -87,7 +95,11 @@ def main() -> None:
                 repo_type=repo_type,
                 revision=revision,
             )
-            remote_stems = _remote_stems_from_listing(remote_paths, path_in_repo)
+            remote_stems = remote_completed_stems_from_listing(
+                remote_paths,
+                path_in_repo,
+                expected_archive_names,
+            )
             hub_listing_ok = True
         except Exception as e:
             hub_error = str(e)
@@ -115,6 +127,7 @@ def main() -> None:
         "encode_done_on_hub_stems": on_hub_done,
         "encode_done_pending_upload": pending,
         "pending_upload_count": len(pending),
+        "expected_archives_by_shard": expected_archive_names,
         "notes": {
             "upload_command": (
                 f"cd {RENDER_PKG} && python upload_hf_encoded_shards.py "

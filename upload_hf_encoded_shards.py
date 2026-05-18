@@ -209,6 +209,28 @@ def _existing_local_archives(pack_dir: str, shard_name: str) -> list[str]:
     return []
 
 
+def remote_completed_stems_from_listing(
+    paths_in_repo: list[str],
+    path_prefix: str,
+    expected_archive_names: dict[str, list[str]] | None = None,
+) -> set[str]:
+    """Return shard stems complete on Hub via legacy single archive or full part set."""
+    prefix = path_prefix.strip("/").replace("\\", "/") + "/"
+    remote_names = {
+        os.path.basename(p.replace("\\", "/"))
+        for p in paths_in_repo
+        if p.replace("\\", "/").startswith(prefix) and p.endswith(".tar.zst")
+    }
+    completed: set[str] = set()
+    for name in remote_names:
+        if ".part_" not in name and name.endswith(".tar.zst"):
+            completed.add(name[: -len(".tar.zst")])
+    for stem, archive_names in (expected_archive_names or {}).items():
+        if archive_names and all(name in remote_names for name in archive_names):
+            completed.add(stem)
+    return completed
+
+
 def _write_tar_zst(
     members: list[tuple[str, str]],
     out_path: str,

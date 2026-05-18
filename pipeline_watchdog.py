@@ -335,16 +335,17 @@ def _classify_all(
 
 
 def _remote_tar_set(
-    repo_id: str, repo_type: str, path_in_repo: str, token: str | None = None
+    repo_id: str,
+    repo_type: str,
+    path_in_repo: str,
+    token: str | None = None,
+    expected_archive_names: dict[str, list[str]] | None = None,
 ) -> set[str]:
     from huggingface_hub import HfApi
+    from upload_hf_encoded_shards import remote_completed_stems_from_listing
 
-    prefix = path_in_repo.strip("/") + "/"
-    names: set[str] = set()
-    for p in HfApi(token=token).list_repo_files(repo_id, repo_type=repo_type):
-        if p.startswith(prefix) and p.endswith(".tar.zst"):
-            names.add(os.path.basename(p).replace(".tar.zst", ""))
-    return names
+    paths = HfApi(token=token).list_repo_files(repo_id, repo_type=repo_type)
+    return remote_completed_stems_from_listing(paths, path_in_repo, expected_archive_names)
 
 
 def _delete_source_shard_tar_after_render_if_enabled(cfg: dict, shard_stem: str) -> None:
@@ -373,7 +374,7 @@ def _try_upload_shard_after_encode_done(
     path_in_repo = (hf_up.get("path_in_repo") or "github/render").strip("/")
 
     from huggingface_hub import HfApi
-    from upload_hf_encoded_shards import _remote_size, delete_source_shard_tar_if_enabled
+    from upload_hf_encoded_shards import delete_source_shard_tar_if_enabled
 
     hf_api = HfApi(token=hf_token)
 
@@ -386,15 +387,7 @@ def _try_upload_shard_after_encode_done(
         ent["upload"] = "done"
         ent["last_error"] = None
         if cfg.get("pipeline", {}).get("delete_source_shard_tar"):
-            rel = f"{path_in_repo}/{stem}.tar.zst"
-            rsz = _remote_size(
-                hf_api,
-                hf_up["repo_id"],
-                hf_up.get("repo_type", "dataset"),
-                rel,
-            )
-            if rsz and rsz > 0:
-                delete_source_shard_tar_if_enabled(cfg, stem)
+            delete_source_shard_tar_if_enabled(cfg, stem)
         return
 
     print(f"[WATCHDOG] {stem}: upload", flush=True)
@@ -1083,11 +1076,38 @@ def main() -> None:
         hf_tok = hf_hub_token(cfg)
         if watchdog_mode != "render_only" and hf_up.get("enabled", False):
             try:
+                from encoders import ALL_STAGES
+                from upload_hf_encoded_shards import _plan_archives
+
+                stages = [s for s in ALL_STAGES if cfg.get("stages", {}).get(s, True)]
+                classify = _classify_all(cfg["paths"]["render_dir"], stages, cfg, state)
+                arch = hf_up.get("archive") or {}
+                includes: list[str] = list(arch.get("include") or ["latents", "transforms.json", "mesh.ply"])
+                exclude_globs: list[str] = list(arch.get("exclude_globs") or [])
+                max_part_bytes = int(arch.get("max_part_bytes") or 0)
+                expected_archive_names: dict[str, list[str]] = {}
+                for stem, status in classify.items():
+                    if status != "encode_done":
+                        continue
+                    shard_path = os.path.join(cfg["paths"]["render_dir"], stem)
+                    if not os.path.isdir(shard_path):
+                        continue
+                    expected_archive_names[stem] = [
+                        archive_name
+                        for archive_name, _ in _plan_archives(
+                            stem,
+                            shard_path,
+                            includes,
+                            exclude_globs,
+                            max_part_bytes,
+                        )
+                    ]
                 remote = _remote_tar_set(
                     hf_up["repo_id"],
                     hf_up.get("repo_type", "dataset"),
                     hf_up.get("path_in_repo", "github/render"),
                     token=hf_tok,
+                    expected_archive_names=expected_archive_names,
                 )
                 print(f"[WATCHDOG] Hub has {len(remote)} shard archive(s) under {hf_up.get('path_in_repo')}", flush=True)
             except Exception as e:
