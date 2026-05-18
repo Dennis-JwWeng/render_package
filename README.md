@@ -405,6 +405,27 @@ python upload_hf_encoded_shards.py \
   --all-verified --force
 ```
 
+For production batches with large shards, prefer the upload watchdog wrapper.
+It uploads one shard at a time, skips shards already present on Hub, and
+retries a shard if the upload process exceeds a timeout:
+
+```bash
+tmux new-session -d -s trellis_upload \
+  'cd /path/to/render_package && source envs/env/bin/activate && \
+   python upload_hf_shards_watchdog.py \
+     --config config/trellis_github_archives_6_first100.yaml \
+     --all-verified --skip-remote --force \
+     --timeout-minutes 90 --retries 3 \
+     2>&1 | tee -a /path/to/<data_root>/github/upload_watchdog.log'
+```
+
+Some encoded shards can be much larger than their source `.tar.zst`: the source
+archive may be ~2 GiB, while encoded `latents/` plus `mesh.ply` and
+`transforms.json` can produce a 10 GiB upload archive for shards with many
+objects. If a progress bar appears stuck, check network/process activity before
+killing it; the watchdog wrapper is intended to make any required retry
+per-shard rather than restarting the whole batch.
+
 **Refresh `upload_record.json` (Hub listing vs local encode_done in shard range):**
 
 ```bash
