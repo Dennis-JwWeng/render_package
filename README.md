@@ -322,12 +322,20 @@ For each shard in that range, the full watchdog does:
 download shard tar.zst -> render mesh/images/transforms -> encode latents -> pack encoded archive -> upload -> cleanup
 ```
 
-The uploaded archive is one `github/render/<shard_id>.tar.zst` per shard. It contains only the encoded deliverables configured under `hf.upload.archive.include`, normally:
+The uploaded archive is shard-scoped. Small shards keep the legacy
+`github/render/<shard_id>.tar.zst` name; large shards can be split on object
+boundaries into `github/render/<shard_id>.part_00000.tar.zst`,
+`github/render/<shard_id>.part_00001.tar.zst`, and so on. Splitting is
+controlled by `hf.upload.archive.max_part_bytes` and keeps every object's
+`latents/`, `transforms.json`, and `mesh.ply` in the same part. The archive
+contains only the encoded deliverables configured under `hf.upload.archive.include`,
+normally:
 
 ```yaml
 hf:
   upload:
     archive:
+      max_part_bytes: 5000000000
       include:
         - latents
         - transforms.json
@@ -336,7 +344,9 @@ hf:
         - "images/**/*.png"
 ```
 
-Rendered PNGs and intermediate render folders are not uploaded. After remote size verification succeeds, the uploader can reclaim local space according to config:
+Rendered PNGs and intermediate render folders are not uploaded. After every part
+for a shard passes remote size verification, the uploader can reclaim local space
+according to config:
 
 ```yaml
 pipeline:
@@ -351,7 +361,7 @@ hf:
 That removes:
 
 - downloaded source shards: `<data_root>/shards/github/<shard_id>.tar.zst`
-- temporary upload archives: `<data_root>/github/pack_for_upload/<shard_id>.tar.zst`
+- temporary upload archives: `<data_root>/github/pack_for_upload/<shard_id>.tar.zst` or `<data_root>/github/pack_for_upload/<shard_id>.part_*.tar.zst`
 - rendered shard directories: `<data_root>/github/render/<shard_id>/`
 
 For long runs, start it in `tmux` so closing Cursor or SSH does not stop the job:
@@ -406,8 +416,9 @@ python upload_hf_encoded_shards.py \
 ```
 
 For production batches with large shards, prefer the upload watchdog wrapper.
-It uploads one shard at a time, skips shards already present on Hub, and
-retries a shard if the upload process exceeds a timeout:
+It uploads one shard at a time, lets `upload_hf_encoded_shards.py` handle every
+part for that shard, skips shards already complete on Hub (legacy single file or
+full part set), and retries a shard if the upload process exceeds a timeout:
 
 ```bash
 tmux new-session -d -s trellis_upload \
@@ -421,10 +432,10 @@ tmux new-session -d -s trellis_upload \
 
 Some encoded shards can be much larger than their source `.tar.zst`: the source
 archive may be ~2 GiB, while encoded `latents/` plus `mesh.ply` and
-`transforms.json` can produce a 10 GiB upload archive for shards with many
-objects. If a progress bar appears stuck, check network/process activity before
-killing it; the watchdog wrapper is intended to make any required retry
-per-shard rather than restarting the whole batch.
+`transforms.json` can produce around 10 GiB of upload data for shards with many
+objects. With `max_part_bytes: 5000000000`, those large outputs are uploaded as
+several smaller archives, improving retry behavior without changing shard-level
+pipeline status or cleanup.
 
 **Refresh `upload_record.json` (Hub listing vs local encode_done in shard range):**
 

@@ -53,6 +53,9 @@ hf:
     archive:
       format: tar_zst
       zstd_level: 10
+      # Split large encoded shards on object boundaries for more stable uploads.
+      # Single-part shards keep the legacy <shard_id>.tar.zst name.
+      max_part_bytes: 5000000000
       include:
         - latents
         - transforms.json

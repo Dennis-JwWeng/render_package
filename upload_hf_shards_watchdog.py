@@ -8,6 +8,7 @@ block the whole batch forever.
 from __future__ import annotations
 
 import argparse
+import glob
 import os
 import signal
 import subprocess
@@ -19,9 +20,10 @@ if RENDER_PKG not in sys.path:
     sys.path.insert(0, RENDER_PKG)
 
 
-def _remote_stems(cfg: dict) -> set[str]:
+def _remote_completed_stems(cfg: dict) -> set[str]:
     from encoders.config import hf_hub_token
     from huggingface_hub import HfApi
+    from upload_hf_encoded_shards import _plan_archives
 
     up = (cfg.get("hf") or {}).get("upload") or {}
     prefix = (up.get("path_in_repo") or "github/render").strip("/") + "/"
@@ -33,11 +35,32 @@ def _remote_stems(cfg: dict) -> set[str]:
         repo_type=up.get("repo_type", "dataset"),
         revision=up.get("revision") or "main",
     )
-    return {
-        os.path.basename(p)[: -len(".tar.zst")]
+    remote_names = {
+        os.path.basename(p)
         for p in files
         if p.startswith(prefix) and p.endswith(".tar.zst")
     }
+
+    completed: set[str] = set()
+    render_dir = cfg["paths"]["render_dir"]
+    arch = up.get("archive") or {}
+    includes: list[str] = list(arch.get("include") or ["latents", "transforms.json", "mesh.ply"])
+    exclude_globs: list[str] = list(arch.get("exclude_globs") or [])
+    max_part_bytes = int(arch.get("max_part_bytes") or 0)
+    for single in remote_names:
+        if ".part_" not in single:
+            completed.add(single[: -len(".tar.zst")])
+
+    for shard_path in glob.glob(os.path.join(render_dir, "shard_*")):
+        if not os.path.isdir(shard_path):
+            continue
+        stem = os.path.basename(shard_path)
+        if stem in completed:
+            continue
+        plans = _plan_archives(stem, shard_path, includes, exclude_globs, max_part_bytes)
+        if plans and all(archive_name in remote_names for archive_name, _ in plans):
+            completed.add(stem)
+    return completed
 
 
 def _encode_done_stems(cfg: dict) -> list[str]:
@@ -55,7 +78,7 @@ def _select_stems(args: argparse.Namespace, cfg: dict) -> list[str]:
     if args.all_verified:
         stems = _encode_done_stems(cfg)
         if args.skip_remote:
-            remote = _remote_stems(cfg)
+            remote = _remote_completed_stems(cfg)
             stems = [s for s in stems if s not in remote]
         return stems
     raise SystemExit("Pass --shards or --all-verified.")

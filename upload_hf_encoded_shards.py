@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import fnmatch
+import glob
 import os
 import shutil
 import sys
@@ -136,6 +137,78 @@ def _iter_pack_members(
     return out
 
 
+def _split_members_by_object(
+    members: list[tuple[str, str]],
+    max_part_bytes: int,
+) -> list[list[tuple[str, str]]]:
+    """Split archive members on object boundaries using uncompressed size estimates."""
+    if max_part_bytes <= 0:
+        return [members]
+
+    groups: list[list[tuple[str, str]]] = []
+    current_obj: str | None = None
+    current_group: list[tuple[str, str]] = []
+    for abs_path, arcname in members:
+        obj = arcname.split("/", 1)[0]
+        if current_obj is None:
+            current_obj = obj
+        if obj != current_obj:
+            groups.append(current_group)
+            current_group = []
+            current_obj = obj
+        current_group.append((abs_path, arcname))
+    if current_group:
+        groups.append(current_group)
+
+    parts: list[list[tuple[str, str]]] = []
+    current_part: list[tuple[str, str]] = []
+    current_size = 0
+    for group in groups:
+        group_size = sum(os.path.getsize(abs_path) for abs_path, _ in group)
+        if current_part and current_size + group_size > max_part_bytes:
+            parts.append(current_part)
+            current_part = []
+            current_size = 0
+        current_part.extend(group)
+        current_size += group_size
+    if current_part:
+        parts.append(current_part)
+    return parts
+
+
+def _archive_name(shard_name: str, part_idx: int, part_count: int) -> str:
+    if part_count == 1:
+        return f"{shard_name}.tar.zst"
+    return f"{shard_name}.part_{part_idx:05d}.tar.zst"
+
+
+def _plan_archives(
+    shard_name: str,
+    shard_path: str,
+    includes: list[str],
+    exclude_globs: list[str],
+    max_part_bytes: int,
+) -> list[tuple[str, list[tuple[str, str]]]]:
+    members = _iter_pack_members(shard_path, includes, exclude_globs)
+    if not members:
+        return []
+    parts = _split_members_by_object(members, max_part_bytes)
+    return [
+        (_archive_name(shard_name, i, len(parts)), part_members)
+        for i, part_members in enumerate(parts)
+    ]
+
+
+def _existing_local_archives(pack_dir: str, shard_name: str) -> list[str]:
+    part_paths = sorted(glob.glob(os.path.join(pack_dir, f"{shard_name}.part_*.tar.zst")))
+    if part_paths:
+        return [os.path.basename(p) for p in part_paths]
+    single = os.path.join(pack_dir, f"{shard_name}.tar.zst")
+    if os.path.isfile(single):
+        return [os.path.basename(single)]
+    return []
+
+
 def _write_tar_zst(
     members: list[tuple[str, str]],
     out_path: str,
@@ -204,6 +277,7 @@ def main() -> None:
     includes: list[str] = list(arch.get("include") or ["latents", "transforms.json", "mesh.ply"])
     exclude_globs: list[str] = list(arch.get("exclude_globs") or [])
     zstd_level = int(arch.get("zstd_level", 10))
+    max_part_bytes = int(arch.get("max_part_bytes") or 0)
     verify_local = bool(up.get("verify_local_archive_before_upload", True))
     verify_remote = bool(up.get("verify_remote_after_upload", True))
     delete_after = bool(up.get("delete_local_archive_after_success", True)) and not args.keep_local
@@ -257,94 +331,120 @@ def main() -> None:
             print(f"[SKIP] {name} not encode_done (status={status_all.get(name, 'missing')})", flush=True)
             continue
 
-        archive_name = f"{name}.tar.zst"
-        local_archive = os.path.join(pack_dir, archive_name)
-        remote_rel = f"{path_in_repo}/{archive_name}"
-
         if args.upload_only:
-            if not os.path.isfile(local_archive):
-                print(f"[SKIP] no local archive {local_archive}", flush=True)
-                continue
+            archive_plans = [(n, []) for n in _existing_local_archives(pack_dir, name)]
         else:
-            members = _iter_pack_members(shard_path, includes, exclude_globs)
-            if not members:
+            archive_plans = _plan_archives(
+                name,
+                shard_path,
+                includes,
+                exclude_globs,
+                max_part_bytes,
+            )
+            if not archive_plans:
                 print(f"[SKIP] {name}: no files matched include/exclude rules", flush=True)
                 continue
-            print(f"[PACK] {name}  ({len(members)} files) -> {local_archive}", flush=True)
-            if args.dry_run:
-                for _, arc in members[:8]:
-                    print(f"       + {arc}", flush=True)
-                if len(members) > 8:
-                    print(f"       ... +{len(members) - 8} more", flush=True)
+        if not archive_plans:
+            print(f"[SKIP] no local archive(s) for {name}", flush=True)
+            continue
+
+        shard_ok = True
+        for part_idx, (archive_name, members) in enumerate(archive_plans, 1):
+            local_archive = os.path.join(pack_dir, archive_name)
+            remote_rel = f"{path_in_repo}/{archive_name}"
+
+            if args.upload_only:
+                if not os.path.isfile(local_archive):
+                    print(f"[SKIP] no local archive {local_archive}", flush=True)
+                    shard_ok = False
+                    break
+            else:
+                print(
+                    f"[PACK] {name} part {part_idx}/{len(archive_plans)} "
+                    f"({len(members)} files) -> {local_archive}",
+                    flush=True,
+                )
+                if args.dry_run:
+                    for _, arc in members[:8]:
+                        print(f"       + {arc}", flush=True)
+                    if len(members) > 8:
+                        print(f"       ... +{len(members) - 8} more", flush=True)
+                    continue
+                tmp_fd, tmp_path = tempfile.mkstemp(suffix=".tar.zst", dir=pack_dir)
+                os.close(tmp_fd)
+                try:
+                    _write_tar_zst(members, tmp_path, zstd_level)
+                    os.replace(tmp_path, local_archive)
+                except Exception:
+                    os.unlink(tmp_path)
+                    raise
+
+            if args.dry_run or args.pack_only:
                 continue
-            tmp_fd, tmp_path = tempfile.mkstemp(suffix=".tar.zst", dir=pack_dir)
-            os.close(tmp_fd)
-            try:
-                _write_tar_zst(members, tmp_path, zstd_level)
-                os.replace(tmp_path, local_archive)
-            except Exception:
-                os.unlink(tmp_path)
-                raise
+
+            if verify_local:
+                print(f"[VERIFY] local archive {local_archive}", flush=True)
+                try:
+                    _verify_local_tar_zst(local_archive)
+                except Exception as e:
+                    print(f"[ERROR] local archive failed integrity read: {e}", flush=True)
+                    raise
+
+            local_sz = os.path.getsize(local_archive)
+
+            if remote_set is not None and remote_rel in remote_set:
+                print(f"[SKIP] remote exists {remote_rel}", flush=True)
+                rsz = _remote_size(api, repo_id, repo_type, remote_rel) if verify_remote else None
+                remote_matches = verify_remote and rsz is not None and rsz == local_sz
+                if verify_remote and rsz is None:
+                    print(f"[WARN] could not stat remote {remote_rel}; keeping local pack and source .tar.zst", flush=True)
+                    shard_ok = False
+                elif verify_remote and rsz is not None and rsz != local_sz:
+                    print(
+                        f"[WARN] remote size {rsz} != local {local_sz}; keeping local pack and source .tar.zst",
+                        flush=True,
+                    )
+                    shard_ok = False
+                elif delete_when_skipped and remote_matches:
+                    _maybe_delete_local(local_archive, True)
+                elif delete_when_skipped and not verify_remote:
+                    _maybe_delete_local(local_archive, True)
+                continue
+
+            print(f"[UPLOAD] {local_archive} -> {repo_id} / {remote_rel}", flush=True)
+            api.upload_file(
+                path_or_fileobj=local_archive,
+                path_in_repo=remote_rel,
+                repo_id=repo_id,
+                repo_type=repo_type,
+                revision=up.get("revision") or "main",
+                commit_message=f"Add {archive_name}",
+            )
+
+            rsz_uploaded: int | None = None
+            if verify_remote:
+                rsz_uploaded = _remote_size(api, repo_id, repo_type, remote_rel)
+                if rsz_uploaded is None:
+                    raise RuntimeError(f"Upload finished but remote path missing: {remote_rel}")
+                if rsz_uploaded != local_sz:
+                    raise RuntimeError(
+                        f"Remote size {rsz_uploaded} != local {local_sz} after upload for {remote_rel}"
+                    )
+                print(f"[VERIFY] remote OK size={rsz_uploaded}", flush=True)
+
+            _maybe_delete_local(local_archive, delete_after)
+            if verify_remote and rsz_uploaded != local_sz:
+                shard_ok = False
 
         if args.dry_run or args.pack_only:
             continue
 
-        if verify_local:
-            print(f"[VERIFY] local archive {local_archive}", flush=True)
-            try:
-                _verify_local_tar_zst(local_archive)
-            except Exception as e:
-                print(f"[ERROR] local archive failed integrity read: {e}", flush=True)
-                raise
-
-        local_sz = os.path.getsize(local_archive)
-
-        if remote_set is not None and remote_rel in remote_set:
-            print(f"[SKIP] remote exists {remote_rel}", flush=True)
-            rsz = _remote_size(api, repo_id, repo_type, remote_rel) if verify_remote else None
-            remote_matches = verify_remote and rsz is not None and rsz == local_sz
-            if verify_remote and rsz is None:
-                print(f"[WARN] could not stat remote {remote_rel}; keeping local pack and source .tar.zst", flush=True)
-            elif verify_remote and rsz is not None and rsz != local_sz:
-                print(
-                    f"[WARN] remote size {rsz} != local {local_sz}; keeping local pack and source .tar.zst",
-                    flush=True,
-                )
-            elif delete_when_skipped and remote_matches:
-                _maybe_delete_local(local_archive, True)
-            elif delete_when_skipped and not verify_remote:
-                _maybe_delete_local(local_archive, True)
-            if remote_matches:
-                delete_source_shard_tar_if_enabled(cfg, name)
-                delete_render_shard_dir_if_enabled(cfg, name)
-            continue
-
-        print(f"[UPLOAD] {local_archive} -> {repo_id} / {remote_rel}", flush=True)
-        api.upload_file(
-            path_or_fileobj=local_archive,
-            path_in_repo=remote_rel,
-            repo_id=repo_id,
-            repo_type=repo_type,
-            revision=up.get("revision") or "main",
-            commit_message=f"Add {archive_name}",
-        )
-
-        rsz_uploaded: int | None = None
-        if verify_remote:
-            rsz_uploaded = _remote_size(api, repo_id, repo_type, remote_rel)
-            if rsz_uploaded is None:
-                raise RuntimeError(f"Upload finished but remote path missing: {remote_rel}")
-            if rsz_uploaded != local_sz:
-                raise RuntimeError(
-                    f"Remote size {rsz_uploaded} != local {local_sz} after upload for {remote_rel}"
-                )
-            print(f"[VERIFY] remote OK size={rsz_uploaded}", flush=True)
-
-        _maybe_delete_local(local_archive, delete_after)
-        if not verify_remote or rsz_uploaded == local_sz:
+        if shard_ok:
             delete_source_shard_tar_if_enabled(cfg, name)
-        if rsz_uploaded == local_sz:
-            delete_render_shard_dir_if_enabled(cfg, name)
+            if verify_remote:
+                delete_render_shard_dir_if_enabled(cfg, name)
+        else:
+            print(f"[WARN] {name}: not all archive part(s) verified; keeping source/render", flush=True)
 
 
 if __name__ == "__main__":
