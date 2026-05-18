@@ -104,8 +104,9 @@ def main() -> None:
         except Exception as e:
             hub_error = str(e)
 
-    on_hub_done = sorted(set(encode_done_in_range) & remote_stems)
-    pending = sorted(set(encode_done_in_range) - remote_stems)
+    hub_done_in_range = sorted(remote_stems & stems_expected)
+    local_pending = sorted(set(encode_done_in_range) - remote_stems)
+    expected_pending = sorted(stems_expected - remote_stems)
 
     record = {
         "updated_utc": _utc_now(),
@@ -118,15 +119,23 @@ def main() -> None:
             "enabled_in_yaml": bool(hf_up.get("enabled", False)),
         },
         "expected_stems_in_config": len(stems_expected),
+        "expected_stems": sorted(stems_expected),
         "encode_done_in_range": len(encode_done_in_range),
         "encode_done_stems": encode_done_in_range,
         "hub_listing_ok": hub_listing_ok,
         "hub_error": hub_error,
         "remote_shard_archives_under_prefix": len(remote_stems),
-        "encode_done_on_hub": len(on_hub_done),
-        "encode_done_on_hub_stems": on_hub_done,
-        "encode_done_pending_upload": pending,
-        "pending_upload_count": len(pending),
+        "hub_done_in_range": len(hub_done_in_range),
+        "hub_done_stems": hub_done_in_range,
+        "local_encode_done_pending_upload": local_pending,
+        "local_encode_done_pending_upload_count": len(local_pending),
+        "expected_stems_pending_completion": expected_pending,
+        "expected_stems_pending_completion_count": len(expected_pending),
+        # Backward-compatible names for older runbooks/scripts.
+        "encode_done_on_hub": len(hub_done_in_range),
+        "encode_done_on_hub_stems": hub_done_in_range,
+        "encode_done_pending_upload": local_pending,
+        "pending_upload_count": len(local_pending),
         "expected_archives_by_shard": expected_archive_names,
         "notes": {
             "upload_command": (
@@ -144,13 +153,14 @@ def main() -> None:
 
     print(f"[refresh_upload_record] wrote {out_path}", flush=True)
     print(f"  encode_done (in shard range): {len(encode_done_in_range)}", flush=True)
-    print(f"  on Hub (same stems):          {len(on_hub_done)}", flush=True)
-    print(f"  pending upload:               {len(pending)}", flush=True)
-    if pending:
-        print(f"  pending stems: {', '.join(pending[:12])}{' ...' if len(pending) > 12 else ''}", flush=True)
+    print(f"  Hub done (config range):      {len(hub_done_in_range)}", flush=True)
+    print(f"  local encode_done pending:    {len(local_pending)}", flush=True)
+    print(f"  config stems pending done:    {len(expected_pending)}", flush=True)
+    if local_pending:
+        print(f"  pending local stems: {', '.join(local_pending[:12])}{' ...' if len(local_pending) > 12 else ''}", flush=True)
     if hub_error:
         print(f"  hub_error: {hub_error}", flush=True)
-    if pending:
+    if local_pending:
         print(
             f"\n  Next: {record['notes']['upload_command']}",
             flush=True,
