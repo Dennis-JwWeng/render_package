@@ -128,8 +128,10 @@ def object_encode_complete(scene_dir: str, stages: list[str], cfg: dict | None =
 
     If save_dino_features is false, dino_features.npz may be absent once unilat+slat+ss exist.
     """
-    from encoders import STAGE_DONE_FILES
+    from encoders import STAGE_DONE_FILES, object_is_skipped
 
+    if object_is_skipped(scene_dir):
+        return True
     save_dino = True
     if cfg is not None:
         save_dino = bool(cfg.get("stages", {}).get("save_dino_features", False))
@@ -184,7 +186,11 @@ def object_needs_encode(
       **no** latent files — i.e. never got a real encode product. Objects with
       partial ``latents/*.npz`` are treated as "tried" and not re-queued.
     """
+    from encoders import object_is_skipped
+
     if not os.path.isfile(os.path.join(scene_dir, "mesh.ply")):
+        return False
+    if object_is_skipped(scene_dir):
         return False
     if object_encode_complete(scene_dir, stages, cfg):
         return False

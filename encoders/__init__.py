@@ -7,6 +7,7 @@ Public API:
 """
 from __future__ import annotations
 
+import json
 import os
 import time
 import traceback
@@ -20,10 +21,47 @@ STAGE_DONE_FILES = {
     "slat": "slat.npz",
     "ss": "ss.npz",
 }
+SKIP_FILE = "encode_skipped.json"
 
 
 def _is_done(scene_dir: str, stage: str) -> bool:
     return os.path.isfile(os.path.join(scene_dir, "latents", STAGE_DONE_FILES[stage]))
+
+
+def mark_object_skipped(scene_dir: str, reason: str, stage: str | None = None) -> str:
+    """Persist a deterministic data-quality skip for objects that cannot be encoded."""
+    latents_dir = os.path.join(scene_dir, "latents")
+    os.makedirs(latents_dir, exist_ok=True)
+    path = os.path.join(latents_dir, SKIP_FILE)
+    payload = {
+        "reason": reason,
+        "stage": stage,
+    }
+    with open(path, "w") as f:
+        json.dump(payload, f, indent=2, sort_keys=True)
+        f.write("\n")
+    return path
+
+
+def object_is_skipped(scene_dir: str) -> bool:
+    path = os.path.join(scene_dir, "latents", SKIP_FILE)
+    if not os.path.isfile(path):
+        return False
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        return data.get("reason") in {"too_few_voxels", "invalid_mesh"}
+    except Exception:
+        return False
+
+
+def _skip_reason_from_exception(exc: Exception) -> str | None:
+    msg = str(exc)
+    if "too few voxels" in msg:
+        return "too_few_voxels"
+    if "Empty or invalid mesh" in msg or "Voxelization subprocess failed" in msg:
+        return "invalid_mesh"
+    return None
 
 
 def encode_object(
@@ -49,7 +87,12 @@ def encode_object(
             except Exception as e:
                 print(f"  [features FAIL] {os.path.basename(scene_dir)}: {e}", flush=True)
                 traceback.print_exc()
-                results["dino_features"] = "fail"
+                skip_reason = _skip_reason_from_exception(e)
+                if skip_reason:
+                    mark_object_skipped(scene_dir, skip_reason, "dino_features")
+                    results["dino_features"] = "skip"
+                else:
+                    results["dino_features"] = "fail"
     else:
         results["dino_features"] = "disabled"
 
@@ -77,7 +120,12 @@ def encode_object(
                 results["slat"] = "ok" if r else "fail"
             except Exception as e:
                 print(f"  [slat FAIL] {os.path.basename(scene_dir)}: {e}", flush=True)
-                results["slat"] = "fail"
+                skip_reason = _skip_reason_from_exception(e)
+                if skip_reason:
+                    mark_object_skipped(scene_dir, skip_reason, "slat")
+                    results["slat"] = "skip"
+                else:
+                    results["slat"] = "fail"
     else:
         results["slat"] = "disabled"
 

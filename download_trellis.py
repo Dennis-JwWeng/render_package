@@ -25,6 +25,7 @@ Examples:
     python3 download_trellis.py 5 0 99 --repo-pattern "datasets/ShadesW/trellis500k-github-archives-{}"
 """
 import argparse
+import urllib.error
 import urllib.request
 import json
 import os
@@ -40,11 +41,23 @@ UA = {'User-Agent': 'Mozilla/5.0'}
 
 def api_list(repo, subdir):
     """List all files under a repo subdirectory via HF API."""
-    url = f"{MIRROR}/api/{repo}/tree/{BRANCH}/{subdir}"
-    req = urllib.request.Request(url, headers=UA)
+    # HF mirror returns 308 for tree URLs without a trailing slash.
+    url = f"{MIRROR}/api/{repo}/tree/{BRANCH}/{subdir.rstrip('/')}/"
     try:
+        req = urllib.request.Request(url, headers=UA)
         resp = urllib.request.urlopen(req, timeout=60)
         data = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        if e.code != 308 or not e.headers.get("Location"):
+            print(f"[WARN] Failed to list {subdir}: {e}", flush=True)
+            return []
+        try:
+            req = urllib.request.Request(e.headers["Location"], headers=UA)
+            resp = urllib.request.urlopen(req, timeout=60)
+            data = json.loads(resp.read())
+        except Exception as e2:
+            print(f"[WARN] Failed to list {subdir}: {e2}", flush=True)
+            return []
     except Exception as e:
         print(f"[WARN] Failed to list {subdir}: {e}", flush=True)
         return []
