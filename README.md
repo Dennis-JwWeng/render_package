@@ -141,6 +141,49 @@ Requirements on the target machine:
 - NVIDIA GPU with CUDA 12.x drivers (driver >= 525)
 - No conda, no pip, no internet needed
 
+**Deploy from Hugging Face component archives:** the `Dennis0626/render_package`
+model repo stores the large runtime pieces separately:
+
+- `env.tar.gz` -> `envs/env.tar.gz`
+- `weights.tar.gz` -> `weights/`
+- `blender-3.5.1-linux-x64.tar.gz` -> `blender-3.5.1-linux-x64/`
+
+Starting from a git checkout of this repo:
+
+```bash
+cd render_package
+
+# Download the large component archives from:
+# https://huggingface.co/Dennis0626/render_package/tree/main
+mkdir -p envs
+mv /path/to/env.tar.gz envs/env.tar.gz
+mv /path/to/weights.tar.gz .
+mv /path/to/blender-3.5.1-linux-x64.tar.gz .
+
+# Extract weights and Blender into the repo root.
+tar xzf weights.tar.gz
+tar xzf blender-3.5.1-linux-x64.tar.gz
+
+# Extract and fix the conda environment.
+bash setup.sh
+source envs/env/bin/activate
+```
+
+After extraction, the expected layout is:
+
+```text
+render_package/
+├── blender-3.5.1-linux-x64/blender
+├── envs/
+│   ├── env.tar.gz
+│   └── env/
+├── weights/
+│   ├── dinov2/
+│   ├── trellis/
+│   └── unilat/
+└── config/
+```
+
 **Alternative (build env from spec):** If not using the bundled env, create one
 from the spec files:
 
