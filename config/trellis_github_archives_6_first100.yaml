@@ -63,6 +63,9 @@ hf:
     verify_remote_after_upload: true
     delete_local_archive_after_success: true
     delete_local_when_remote_exists: true
+    # Delete github/render/<shard_id>/ after remote archive size is verified.
+    # The archive intentionally contains encoded outputs only (latents + transforms + mesh), not images.
+    delete_render_dir_after_success: true
 
 weights:
   unilat_encoder: weights/unilat/encoder

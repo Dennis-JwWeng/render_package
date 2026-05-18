@@ -305,6 +305,68 @@ mkdir -p "$TMPDIR"
 python pipeline_watchdog.py --config config/trellis_github_archives_6_first100.yaml
 ```
 
+**Recommended shard-level production flow:**
+
+Use the config to define an inclusive shard index range:
+
+```yaml
+hf:
+  download:
+    shard_index_start: 0
+    shard_index_end: 99
+```
+
+For each shard in that range, the full watchdog does:
+
+```text
+download shard tar.zst -> render mesh/images/transforms -> encode latents -> pack encoded archive -> upload -> cleanup
+```
+
+The uploaded archive is one `github/render/<shard_id>.tar.zst` per shard. It contains only the encoded deliverables configured under `hf.upload.archive.include`, normally:
+
+```yaml
+hf:
+  upload:
+    archive:
+      include:
+        - latents
+        - transforms.json
+        - mesh.ply
+      exclude_globs:
+        - "images/**/*.png"
+```
+
+Rendered PNGs and intermediate render folders are not uploaded. After remote size verification succeeds, the uploader can reclaim local space according to config:
+
+```yaml
+pipeline:
+  delete_source_shard_tar: true
+hf:
+  upload:
+    delete_local_archive_after_success: true
+    delete_local_when_remote_exists: true
+    delete_render_dir_after_success: true
+```
+
+That removes:
+
+- downloaded source shards: `<data_root>/shards/github/<shard_id>.tar.zst`
+- temporary upload archives: `<data_root>/github/pack_for_upload/<shard_id>.tar.zst`
+- rendered shard directories: `<data_root>/github/render/<shard_id>/`
+
+For long runs, start it in `tmux` so closing Cursor or SSH does not stop the job:
+
+```bash
+tmux new-session -d -s trellis_watchdog \
+  'cd /path/to/render_package && source envs/env/bin/activate && \
+   export SPCONV_ALGO=native && \
+   export TMPDIR=/path/to/<data_root>/github/.render_tmp && mkdir -p "$TMPDIR" && \
+   python pipeline_watchdog.py --config config/trellis_github_archives_6_first100.yaml \
+     2>&1 | tee -a /path/to/<data_root>/github/watchdog_full.log'
+
+tmux attach -t trellis_watchdog
+```
+
 **Two-phase control (render first, encode later):** use the same `pipeline_state.json`. After all shards have `mesh.ply`, run encode.
 
 ```bash

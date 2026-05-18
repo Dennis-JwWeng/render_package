@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import fnmatch
 import os
+import shutil
 import sys
 import tarfile
 import tempfile
@@ -84,6 +85,18 @@ def delete_source_shard_tar_if_enabled(cfg: dict, shard_stem: str) -> None:
     if os.path.isfile(zst):
         os.remove(zst)
         print(f"[CLEANUP] removed source shard download {zst}", flush=True)
+
+
+def delete_render_shard_dir_if_enabled(cfg: dict, shard_stem: str) -> None:
+    """Remove rendered shard directory after verified upload when enabled."""
+    up = (cfg.get("hf") or {}).get("upload") or {}
+    if not up.get("delete_render_dir_after_success", False):
+        return
+    render_dir = cfg["paths"]["render_dir"]
+    shard_path = os.path.join(render_dir, shard_stem)
+    if os.path.isdir(shard_path):
+        shutil.rmtree(shard_path)
+        print(f"[CLEANUP] removed render shard dir {shard_path}", flush=True)
 
 
 def _iter_pack_members(
@@ -303,6 +316,7 @@ def main() -> None:
                 _maybe_delete_local(local_archive, True)
             if remote_matches:
                 delete_source_shard_tar_if_enabled(cfg, name)
+                delete_render_shard_dir_if_enabled(cfg, name)
             continue
 
         print(f"[UPLOAD] {local_archive} -> {repo_id} / {remote_rel}", flush=True)
@@ -329,6 +343,8 @@ def main() -> None:
         _maybe_delete_local(local_archive, delete_after)
         if not verify_remote or rsz_uploaded == local_sz:
             delete_source_shard_tar_if_enabled(cfg, name)
+        if rsz_uploaded == local_sz:
+            delete_render_shard_dir_if_enabled(cfg, name)
 
 
 if __name__ == "__main__":
